@@ -1,0 +1,2 @@
+multiplier,seed,backend,mean_abs_corr_diff,real_vs_synth_auc,mean_ks_p,median_ks_p
+1,0,sdv_ctgan,0.14076198071956084,0.9983154296875,0.5162770225903835,0.6273777418999238
