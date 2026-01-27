@@ -81,21 +81,21 @@ def normalize_categoricals(df: pd.DataFrame) -> pd.DataFrame:
             s = df[c].astype(str).str.strip().str.lower()
             # handle common tab/space variants even after strip
             s = s.replace({'\tyes': 'yes', '\tno': 'no', 'yes ': 'yes', 'no ': 'no'})
-            df[c] = s.replace({'yes': 1, 'no': 0, 'nan': np.nan})
+            df[c] = pd.to_numeric(s.map({'yes': 1, 'no': 0}), errors='coerce')
 
     # rbc and pc: normal/abnormal (locked mapping)
     for c in NORMAL_ABNORMAL_COLS:
         if c in df.columns:
             s = df[c].astype(str).str.strip().str.lower()
             s = s.replace({'?': np.nan, 'nan': np.nan})
-            df[c] = s.replace({'normal': 0, 'abnormal': 1})
+            df[c] = pd.to_numeric(s.map({'normal': 0, 'abnormal': 1}), errors='coerce')
 
     # pcc and ba: present/notpresent
     for c in PRESENT_COLS:
         if c in df.columns:
             s = df[c].astype(str).str.strip().str.lower()
             s = s.replace({'?': np.nan, 'nan': np.nan})
-            df[c] = s.replace({'notpresent': 0, 'present': 1})
+            df[c] = pd.to_numeric(s.map({'notpresent': 0, 'present': 1}), errors='coerce')
 
     # appet: normalize whitespace/case (kept as categorical for one-hot)
     if 'appet' in df.columns:
@@ -110,7 +110,7 @@ def map_target(df: pd.DataFrame) -> pd.DataFrame:
 
     # IMPORTANT: do NOT use substring 'ckd' in 'notckd'
     y_raw = df[TARGET_RAW_COL].astype(str).str.strip().str.lower()
-    y = y_raw.replace({'ckd': 1, 'notckd': 0})
+    y = y_raw.map({'ckd': 1, 'notckd': 0})
 
     mask = y.isin([0, 1])
     df = df.loc[mask].copy()
