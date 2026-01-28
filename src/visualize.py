@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.config import PREPROC_DIR, RESULTS_DIR, SPLIT_DIR  # noqa: E402
 from src.utils import ensure_dir  # noqa: E402
 
 # Set style
@@ -29,62 +31,87 @@ plt.rcParams['savefig.dpi'] = 300
 plt.rcParams['savefig.bbox'] = 'tight'
 
 
+def _safe_read_csv(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        print(f'Skipping {path.name}: failed to read CSV ({e})')
+        return None
+
+
+def _discover_metrics(results_dir: Path) -> pd.DataFrame:
+    """Load and combine all metrics_*.csv files in results_dir."""
+    frames: list[pd.DataFrame] = []
+    for p in sorted(results_dir.glob('metrics_*.csv')):
+        df = _safe_read_csv(p)
+        if df is None or df.empty:
+            continue
+        df = df.copy()
+        df['run'] = p.stem.replace('metrics_', '', 1)
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    for col in ['roc_auc', 'precision', 'recall', 'f1']:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out
+
+
+def _load_test_split() -> tuple[pd.DataFrame, np.ndarray] | None:
+    X_path = Path(PREPROC_DIR) / 'X_test_preproc.csv'
+    y_path = Path(SPLIT_DIR) / 'y_test.csv'
+    if not X_path.exists() or not y_path.exists():
+        return None
+    X_test = pd.read_csv(X_path)
+    y_test = pd.read_csv(y_path)['target'].to_numpy()
+    return X_test, y_test
+
+
+def _parse_model_variant_from_filename(name: str) -> tuple[str, str] | None:
+    if not name.endswith('.joblib'):
+        return None
+    stem = name[:-7]
+    parts = stem.split('_')
+    if len(parts) < 2:
+        return None
+    model = parts[0]
+    variant = '_'.join(parts[1:])
+    return model, variant
+
+
 def plot_model_comparison(results_dir: Path, output_dir: Path) -> None:
-    """Compare model performance: baseline vs synthetic augmentation."""
-    
-    # Load metrics
-    baseline_path = results_dir / 'metrics_baseline.csv'
-    synth_3x_path = results_dir / 'metrics_3x_sdv_gcopula.csv'
-    
-    if not baseline_path.exists() or not synth_3x_path.exists():
-        print('Skipping model comparison: missing metrics files')
+    """Compare model performance across all available runs (metrics_*.csv)."""
+
+    metrics = _discover_metrics(results_dir)
+    if metrics.empty:
+        print('Skipping model comparison: no metrics_*.csv found')
         return
-    
-    baseline = pd.read_csv(baseline_path)
-    synth_3x = pd.read_csv(synth_3x_path)
-    
-    # Combine data
-    baseline['dataset'] = 'Baseline'
-    synth_3x['dataset'] = '3x Synthetic'
-    combined = pd.concat([baseline, synth_3x], ignore_index=True)
-    
-    # Create comparison plots
+
+    run_order = list(dict.fromkeys(metrics['run'].tolist()))
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Model Performance Comparison: Baseline vs 3x Synthetic Augmentation', 
-                 fontsize=16, fontweight='bold', y=0.995)
-    
-    metrics = ['roc_auc', 'f1', 'precision', 'recall']
-    titles = ['ROC-AUC Score', 'F1 Score', 'Precision', 'Recall']
-    
-    for ax, metric, title in zip(axes.flat, metrics, titles):
-        # Group by model and dataset
-        plot_data = combined.pivot(index='model', columns='dataset', values=metric)
-        
-        x = np.arange(len(plot_data.index))
-        width = 0.35
-        
-        bars1 = ax.bar(x - width/2, plot_data['Baseline'], width, 
-                       label='Baseline', alpha=0.8, color='#1f77b4')
-        bars2 = ax.bar(x + width/2, plot_data['3x Synthetic'], width, 
-                       label='3x Synthetic', alpha=0.8, color='#ff7f0e')
-        
-        ax.set_ylabel(title, fontsize=11, fontweight='bold')
-        ax.set_xlabel('Model', fontsize=11, fontweight='bold')
+    fig.suptitle('Model Performance Comparison (All Runs)', fontsize=16, fontweight='bold', y=0.995)
+
+    plot_metrics = ['roc_auc', 'f1', 'precision', 'recall']
+    titles = ['ROC-AUC', 'F1', 'Precision', 'Recall']
+
+    for ax, metric, title in zip(axes.flat, plot_metrics, titles):
+        df = metrics[['model', 'run', metric]].dropna()
+        if df.empty:
+            ax.set_visible(False)
+            continue
+        sns.barplot(data=df, x='model', y=metric, hue='run', hue_order=run_order, ax=ax)
+        ax.set_ylabel(title)
+        ax.set_xlabel('Model')
         ax.set_title(title, fontsize=12, pad=10)
-        ax.set_xticks(x)
-        ax.set_xticklabels([m.upper() for m in plot_data.index])
-        ax.legend(loc='lower right')
-        ax.set_ylim((0.94, 1.005))
         ax.grid(axis='y', alpha=0.3)
-        
-        # Add value labels on bars
-        for bars in [bars1, bars2]:
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{height:.4f}',
-                       ha='center', va='bottom', fontsize=8)
-    
+        ax.legend(loc='best', fontsize=8)
+
     plt.tight_layout()
     output_path = output_dir / 'model_comparison.png'
     plt.savefig(output_path)
@@ -92,31 +119,49 @@ def plot_model_comparison(results_dir: Path, output_dir: Path) -> None:
     plt.close()
 
 
-def plot_synthetic_quality(results_dir: Path, output_dir: Path) -> None:
-    """Visualize synthetic data quality metrics."""
-    
-    # Load quality metrics
-    qc_path = results_dir / 'synth_qc_3x_sdv_gcopula_seed0.csv'
-    ks_path = results_dir / 'ks_3x_sdv_gcopula_seed0.csv'
-    
-    if not qc_path.exists() or not ks_path.exists():
-        print('Skipping synthetic quality: missing QC files')
+def plot_synthetic_quality(results_dir: Path, output_dir: Path, synth_tag: str | None = None) -> None:
+    """Visualize synthetic data quality metrics (best-effort)."""
+
+    qc_files = sorted(results_dir.glob('synth_qc_*.csv'))
+    ks_files = sorted(results_dir.glob('ks_*.csv'))
+    if not qc_files or not ks_files:
+        print('Skipping synthetic quality: missing synth_qc_*.csv or ks_*.csv')
+        return
+
+    def _pick(files: list[Path]) -> Path:
+        if synth_tag:
+            tagged = [p for p in files if synth_tag in p.stem]
+            if tagged:
+                return tagged[0]
+        for preferred in ['3x_sdv_gcopula', '1x_sdv_gcopula', '3x', '1x']:
+            cand = [p for p in files if preferred in p.stem]
+            if cand:
+                return cand[0]
+        return files[0]
+
+    qc_path = _pick(qc_files)
+    ks_path = _pick(ks_files)
+
+    qc = _safe_read_csv(qc_path)
+    ks = _safe_read_csv(ks_path)
+    if qc is None or ks is None or qc.empty or ks.empty:
+        print('Skipping synthetic quality: selected QC/KS file empty or unreadable')
         return
     
-    qc = pd.read_csv(qc_path)
-    ks = pd.read_csv(ks_path)
-    
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Synthetic Data Quality Assessment (3x Gaussian Copula)', 
+    fig.suptitle(f'Synthetic Data Quality Assessment ({qc_path.stem})',
                  fontsize=16, fontweight='bold', y=0.995)
     
     # 1. Quality metrics summary
     ax1 = axes[0, 0]
+    def _get0(col: str) -> float:
+        return float(qc[col].iloc[0]) if col in qc.columns else float('nan')
+
     metrics_data = {
-        'Mean Abs\nCorr Diff': qc['mean_abs_corr_diff'].values[0],
-        'Real vs Synth\nClassifier AUC': qc['real_vs_synth_auc'].values[0],
-        'Mean KS\np-value': qc['mean_ks_p'].values[0],
-        'Median KS\np-value': qc['median_ks_p'].values[0]
+        'Mean Abs\nCorr Diff': _get0('mean_abs_corr_diff'),
+        'Real vs Synth\nAUC': _get0('real_vs_synth_auc'),
+        'Mean KS\np-value': _get0('mean_ks_p'),
+        'Median KS\np-value': _get0('median_ks_p'),
     }
     
     bars = ax1.barh(list(metrics_data.keys()), list(metrics_data.values()), 
@@ -183,60 +228,8 @@ def plot_synthetic_quality(results_dir: Path, output_dir: Path) -> None:
     ax4.set_title('Feature Distribution Similarity', fontsize=12, pad=10)
     
     plt.tight_layout()
-    output_path = output_dir / 'synthetic_quality.png'
-    plt.savefig(output_path)
-    print(f'Saved: {output_path}')
-    plt.close()
-
-
-def plot_brier_score_comparison(results_dir: Path, output_dir: Path) -> None:
-    """Compare Brier scores (calibration metric)."""
-    
-    baseline_path = results_dir / 'metrics_baseline.csv'
-    synth_3x_path = results_dir / 'metrics_3x_sdv_gcopula.csv'
-    
-    if not baseline_path.exists() or not synth_3x_path.exists():
-        print('Skipping Brier score comparison: missing metrics files')
-        return
-    
-    baseline = pd.read_csv(baseline_path)
-    synth_3x = pd.read_csv(synth_3x_path)
-    
-    baseline['dataset'] = 'Baseline'
-    synth_3x['dataset'] = '3x Synthetic'
-    combined = pd.concat([baseline, synth_3x], ignore_index=True)
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Pivot and plot
-    plot_data = combined.pivot(index='model', columns='dataset', values='brier')
-    
-    x = np.arange(len(plot_data.index))
-    width = 0.35
-    
-    bars1 = ax.bar(x - width/2, plot_data['Baseline'], width, 
-                   label='Baseline', alpha=0.8, color='#1f77b4')
-    bars2 = ax.bar(x + width/2, plot_data['3x Synthetic'], width, 
-                   label='3x Synthetic', alpha=0.8, color='#ff7f0e')
-    
-    ax.set_ylabel('Brier Score (Lower is Better)', fontsize=12, fontweight='bold')
-    ax.set_xlabel('Model', fontsize=12, fontweight='bold')
-    ax.set_title('Model Calibration: Brier Score Comparison', fontsize=14, fontweight='bold', pad=15)
-    ax.set_xticks(x)
-    ax.set_xticklabels([m.upper() for m in plot_data.index])
-    ax.legend(loc='upper right')
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.4f}',
-                   ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    output_path = output_dir / 'brier_score_comparison.png'
+    tag = synth_tag or qc_path.stem.replace('synth_qc_', '', 1)
+    output_path = output_dir / f'synthetic_quality_{tag}.png'
     plt.savefig(output_path)
     print(f'Saved: {output_path}')
     plt.close()
@@ -244,16 +237,37 @@ def plot_brier_score_comparison(results_dir: Path, output_dir: Path) -> None:
 
 def plot_feature_distributions(data_dir: Path, results_dir: Path, output_dir: Path) -> None:
     """Compare real vs synthetic feature distributions."""
-    
-    # Load preprocessed data
-    X_train_path = data_dir / 'processed' / 'preprocessed' / 'X_train_preproc.csv'
-    X_synth_path = data_dir / 'synthetic' / 'X_synth_3x_sdv_gcopula_preproc.csv'
-    ks_path = results_dir / 'ks_3x_sdv_gcopula_seed0.csv'
-    
-    if not all([X_train_path.exists(), X_synth_path.exists(), ks_path.exists()]):
-        print('Skipping feature distributions: missing data files')
+
+    X_train_path = Path(PREPROC_DIR) / 'X_train_preproc.csv'
+    if not X_train_path.exists():
+        print('Skipping feature distributions: missing X_train_preproc.csv')
         return
-    
+
+    synth_files = sorted((data_dir / 'synthetic').glob('X_synth_*_preproc.csv'))
+    ks_files = sorted(results_dir.glob('ks_*.csv'))
+    if not synth_files or not ks_files:
+        print('Skipping feature distributions: missing X_synth_*_preproc.csv or ks_*.csv')
+        return
+
+    preferred = ['3x_sdv_gcopula', '1x_sdv_gcopula', '3x', '1x']
+    X_synth_path = None
+    ks_path = None
+    for tag in preferred:
+        if X_synth_path is None:
+            for p in synth_files:
+                if tag in p.stem:
+                    X_synth_path = p
+                    break
+        if ks_path is None:
+            for p in ks_files:
+                if tag in p.stem:
+                    ks_path = p
+                    break
+        if X_synth_path is not None and ks_path is not None:
+            break
+    X_synth_path = X_synth_path or synth_files[0]
+    ks_path = ks_path or ks_files[0]
+
     X_train = pd.read_csv(X_train_path)
     X_synth = pd.read_csv(X_synth_path)
     ks = pd.read_csv(ks_path)
@@ -284,7 +298,7 @@ def plot_feature_distributions(data_dir: Path, results_dir: Path, output_dir: Pa
             ax.grid(alpha=0.3)
     
     plt.tight_layout()
-    output_path = output_dir / 'feature_distributions_best.png'
+    output_path = output_dir / f'feature_distributions_best_{X_synth_path.stem}.png'
     plt.savefig(output_path)
     print(f'Saved: {output_path}')
     plt.close()
@@ -309,7 +323,7 @@ def plot_feature_distributions(data_dir: Path, results_dir: Path, output_dir: Pa
             ax.grid(alpha=0.3)
     
     plt.tight_layout()
-    output_path = output_dir / 'feature_distributions_challenging.png'
+    output_path = output_dir / f'feature_distributions_challenging_{X_synth_path.stem}.png'
     plt.savefig(output_path)
     print(f'Saved: {output_path}')
     plt.close()
@@ -317,16 +331,11 @@ def plot_feature_distributions(data_dir: Path, results_dir: Path, output_dir: Pa
 
 def plot_performance_summary(results_dir: Path, output_dir: Path) -> None:
     """Create a comprehensive summary visualization."""
-    
-    baseline_path = results_dir / 'metrics_baseline.csv'
-    synth_3x_path = results_dir / 'metrics_3x_sdv_gcopula.csv'
-    
-    if not baseline_path.exists() or not synth_3x_path.exists():
-        print('Skipping performance summary: missing metrics files')
+
+    metrics = _discover_metrics(results_dir)
+    if metrics.empty:
+        print('Skipping performance summary: no metrics_*.csv found')
         return
-    
-    baseline = pd.read_csv(baseline_path)
-    synth_3x = pd.read_csv(synth_3x_path)
     
     fig = plt.figure(figsize=(16, 10), constrained_layout=False)
     gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35, top=0.95, bottom=0.05, left=0.05, right=0.98)
@@ -337,80 +346,103 @@ def plot_performance_summary(results_dir: Path, output_dir: Path) -> None:
     # Main heatmap
     ax_main = fig.add_subplot(gs[0:2, 0:2])
     
-    baseline['dataset'] = 'Baseline'
-    synth_3x['dataset'] = '3x Synth'
-    combined = pd.concat([baseline, synth_3x], ignore_index=True)
-    
-    # Create pivot table for heatmap
-    metrics_for_heatmap = ['roc_auc', 'precision', 'recall', 'f1', 'brier']
-    heatmap_data = []
-    
-    for model in ['lr', 'rf', 'xgb']:
-        for dataset in ['Baseline', '3x Synth']:
-            row_data = combined[(combined['model'] == model) & (combined['dataset'] == dataset)]
-            if len(row_data) > 0:
-                values = [row_data[m].values[0] for m in metrics_for_heatmap]
-                heatmap_data.append(values)
-    
-    heatmap_df = pd.DataFrame(
-        heatmap_data,
-        index=[f'{m.upper()}\n{d}' for m in ['lr', 'rf', 'xgb'] for d in ['Baseline', '3x Synth']],
-        columns=['ROC-AUC', 'Precision', 'Recall', 'F1', 'Brier']
+    combined = metrics.copy()
+    combined['label'] = combined['model'].astype(str).str.upper() + '\n' + combined['run'].astype(str)
+
+    metrics_for_heatmap = ['roc_auc', 'precision', 'recall', 'f1', 'brier', 'ece']
+    heatmap_df = combined.pivot_table(index='label', values=metrics_for_heatmap, aggfunc=lambda s: s.iloc[0])
+    heatmap_df = heatmap_df.rename(
+        columns={
+            'roc_auc': 'ROC-AUC',
+            'precision': 'Precision',
+            'recall': 'Recall',
+            'f1': 'F1',
+            'brier': 'Brier',
+            'ece': 'ECE',
+        }
     )
-    
-    sns.heatmap(heatmap_df, annot=True, fmt='.4f', cmap='RdYlGn', 
-                center=0.97, vmin=0.94, vmax=1.0, ax=ax_main, cbar_kws={'label': 'Score'})
-    ax_main.set_title('Performance Metrics Heatmap', fontsize=14, fontweight='bold', pad=15)
+
+    sns.heatmap(heatmap_df, annot=True, fmt='.4f', cmap='RdYlGn', ax=ax_main, cbar_kws={'label': 'Score'})
+    ax_main.set_title('Performance + Calibration Heatmap', fontsize=14, fontweight='bold', pad=15)
     ax_main.set_xlabel('')
-    ax_main.set_ylabel('Model + Dataset', fontsize=11, fontweight='bold')
+    ax_main.set_ylabel('Model + Run', fontsize=11, fontweight='bold')
     
-    # ROC-AUC comparison
+    # ROC-AUC trend for up to 3 runs
     ax1 = fig.add_subplot(gs[0, 2])
-    models = baseline['model'].values
+
+    runs = list(dict.fromkeys(combined['run'].tolist()))[:3]
+    models = sorted(combined['model'].unique().tolist())
     x_pos = np.arange(len(models))
-    
-    ax1.plot(x_pos, baseline['roc_auc'].to_numpy(), 'o-', label='Baseline', linewidth=2, markersize=8)
-    ax1.plot(x_pos, synth_3x['roc_auc'].to_numpy(), 's-', label='3x Synth', linewidth=2, markersize=8)
+
+    for run in runs:
+        yv = [
+            float(combined[(combined['model'] == m) & (combined['run'] == run)]['roc_auc'].iloc[0])
+            if not combined[(combined['model'] == m) & (combined['run'] == run)].empty else np.nan
+            for m in models
+        ]
+        ax1.plot(x_pos, yv, marker='o', linewidth=2, label=run)
+
     ax1.set_xticks(x_pos)
     ax1.set_xticklabels([m.upper() for m in models])
     ax1.set_ylabel('ROC-AUC', fontweight='bold')
     ax1.set_title('ROC-AUC', fontsize=12, fontweight='bold')
-    ax1.legend(loc='lower right', fontsize=8)
-    ax1.set_ylim((0.99, 1.002))
+    ax1.legend(loc='best', fontsize=8)
     ax1.grid(alpha=0.3)
     
-    # F1 Score comparison
+    # F1 trend
     ax2 = fig.add_subplot(gs[1, 2])
-    ax2.plot(x_pos, baseline['f1'].to_numpy(), 'o-', label='Baseline', linewidth=2, markersize=8)
-    ax2.plot(x_pos, synth_3x['f1'].to_numpy(), 's-', label='3x Synth', linewidth=2, markersize=8)
+
+    for run in runs:
+        yv = [
+            float(combined[(combined['model'] == m) & (combined['run'] == run)]['f1'].iloc[0])
+            if not combined[(combined['model'] == m) & (combined['run'] == run)].empty else np.nan
+            for m in models
+        ]
+        ax2.plot(x_pos, yv, marker='o', linewidth=2, label=run)
+
     ax2.set_xticks(x_pos)
     ax2.set_xticklabels([m.upper() for m in models])
     ax2.set_ylabel('F1 Score', fontweight='bold')
     ax2.set_title('F1 Score', fontsize=12, fontweight='bold')
-    ax2.legend(loc='lower right', fontsize=8)
-    ax2.set_ylim((0.975, 0.992))
+    ax2.legend(loc='best', fontsize=8)
     ax2.grid(alpha=0.3)
     
-    # Performance delta
+    # Performance delta between the first two runs (if available)
     ax3 = fig.add_subplot(gs[2, :])
+
+    if len(runs) >= 2:
+        base_run, other_run = runs[0], runs[1]
+        metrics_to_compare = ['roc_auc', 'precision', 'recall', 'f1']
+        x = np.arange(len(models))
+        width = 0.2
+
+        for i, metric in enumerate(metrics_to_compare):
+            base_vals = np.array([
+                float(combined[(combined['model'] == m) & (combined['run'] == base_run)][metric].iloc[0])
+                if not combined[(combined['model'] == m) & (combined['run'] == base_run)].empty else np.nan
+                for m in models
+            ])
+            other_vals = np.array([
+                float(combined[(combined['model'] == m) & (combined['run'] == other_run)][metric].iloc[0])
+                if not combined[(combined['model'] == m) & (combined['run'] == other_run)].empty else np.nan
+                for m in models
+            ])
+            delta = (other_vals - base_vals) * 100
+            ax3.bar(x + i * width, delta, width, label=metric.upper(), alpha=0.7)
+
+        ax3.set_title(f'Performance Delta (%): {other_run} vs {base_run}', fontsize=12, fontweight='bold')
+        ax3.set_xticks(x + width * 1.5)
+        ax3.set_xticklabels([m.upper() for m in models])
+        ax3.axhline(0, color='black', linestyle='-', linewidth=1)
+        ax3.legend(loc='upper right', ncol=4)
+        ax3.grid(axis='y', alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, 'Need at least 2 runs for delta plot', ha='center', va='center')
+        ax3.set_axis_off()
     
-    metrics_to_compare = ['roc_auc', 'precision', 'recall', 'f1']
-    x = np.arange(len(models))
-    width = 0.2
-    
-    for i, metric in enumerate(metrics_to_compare):
-        delta = (synth_3x[metric].to_numpy() - baseline[metric].to_numpy()) * 100
-        color = ['green' if d >= 0 else 'red' for d in delta]
-        ax3.bar(x + i*width, delta, width, label=metric.upper(), alpha=0.7)
-    
-    ax3.set_xlabel('Model', fontsize=11, fontweight='bold')
-    ax3.set_ylabel('Performance Change (%)', fontsize=11, fontweight='bold')
-    ax3.set_title('Performance Delta: Synthetic vs Baseline', fontsize=12, fontweight='bold')
-    ax3.set_xticks(x + width * 1.5)
-    ax3.set_xticklabels([m.upper() for m in models])
-    ax3.axhline(0, color='black', linestyle='-', linewidth=1)
-    ax3.legend(loc='upper right', ncol=4)
-    ax3.grid(axis='y', alpha=0.3)
+    if len(runs) >= 2:
+        ax3.set_xlabel('Model', fontsize=11, fontweight='bold')
+        ax3.set_ylabel('Performance Change (%)', fontsize=11, fontweight='bold')
     
     output_path = output_dir / 'performance_summary.png'
     plt.savefig(output_path)
@@ -420,13 +452,16 @@ def plot_performance_summary(results_dir: Path, output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate visualizations for CKD prediction results.')
-    parser.add_argument('--results-dir', type=str, default='results')
+    parser.add_argument('--results-dir', type=str, default=RESULTS_DIR)
     parser.add_argument('--data-dir', type=str, default='data')
+    parser.add_argument('--models-dir', type=str, default='models')
     parser.add_argument('--output-dir', type=str, default='results/visualizations')
+    parser.add_argument('--synth-tag', type=str, default=None, help='Substring to select which synth run to visualize')
     args = parser.parse_args()
     
     results_dir = Path(args.results_dir)
     data_dir = Path(args.data_dir)
+    models_dir = Path(args.models_dir)
     output_dir = ensure_dir(Path(args.output_dir))
     
     print('=' * 60)
@@ -437,15 +472,12 @@ def main() -> None:
     plot_model_comparison(results_dir, output_dir)
     
     print('\n2. Generating synthetic quality assessment...')
-    plot_synthetic_quality(results_dir, output_dir)
+    plot_synthetic_quality(results_dir, output_dir, synth_tag=args.synth_tag)
     
-    print('\n3. Generating Brier score comparison...')
-    plot_brier_score_comparison(results_dir, output_dir)
-    
-    print('\n4. Generating feature distribution comparisons...')
+    print('\n3. Generating feature distribution comparisons...')
     plot_feature_distributions(data_dir, results_dir, output_dir)
     
-    print('\n5. Generating performance summary...')
+    print('\n4. Generating performance summary...')
     plot_performance_summary(results_dir, output_dir)
     
     print('\n' + '=' * 60)

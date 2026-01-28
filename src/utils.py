@@ -23,3 +23,11 @@ def read_json(path: str | Path) -> Any:
 
 def to_list(x: Iterable[str]) -> list[str]:
     return list(x)
+
+
+def clip_to_clinical_bounds(df, bounds):
+    out = df.copy()
+    for col, (lo, hi) in bounds.items():
+        if col in out.columns:
+            out[col] = out[col].clip(lo, hi)
+    return out

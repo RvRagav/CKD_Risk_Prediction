@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 
 from sklearn.compose import ColumnTransformer
-from sklearn.experimental import enable_iterative_imputer  # noqa: F401
-from sklearn.impute import IterativeImputer, SimpleImputer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.config import (  # noqa: E402
     CAT_COLS,
+    CLINICAL_BOUNDS,
     CONT_COLS,
     ORD_COLS,
     NORMAL_ABNORMAL_COLS,
@@ -38,6 +39,81 @@ from src.config import (  # noqa: E402
     PREPROC_DIR,
 )
 from src.utils import ensure_dir, save_json  # noqa: E402
+
+
+def model_based_impute(train_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFrame:
+    """Feature-wise regression imputation (paper-aligned).
+
+    Trains per-feature regressors on *train_df only* and imputes missing values
+    in *full_df*. Categorical predictors are one-hot encoded using categories
+    learned from train_df to avoid leakage.
+    """
+
+    imputed = full_df.copy()
+
+    def _make_design_matrices(
+        X_train_raw: pd.DataFrame,
+        X_apply_raw: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        # One-hot encode categoricals using train-only learned columns.
+        # Keep NaNs as their own category so missingness can be predictive.
+        train_dum = pd.get_dummies(X_train_raw, dummy_na=True)
+        apply_dum = pd.get_dummies(X_apply_raw, dummy_na=True)
+        apply_dum = apply_dum.reindex(columns=train_dum.columns, fill_value=0)
+
+        # Any remaining NaNs (from numeric predictors) are filled using train-only medians.
+        medians = train_dum.median(numeric_only=True)
+        train_dum = train_dum.fillna(medians)
+        apply_dum = apply_dum.fillna(medians)
+        return train_dum, apply_dum
+
+    for col in CONT_COLS + ORD_COLS:
+        if col not in imputed.columns:
+            continue
+
+        missing_mask = imputed[col].isna()
+        if int(missing_mask.sum()) == 0:
+            continue
+
+        predictors = [p for p in imputed.columns if p != col]
+
+        train_rows = train_df.dropna(subset=[col])
+        if train_rows.empty:
+            continue
+
+        X_train_raw = train_rows[predictors]
+        y_train = pd.to_numeric(train_rows[col], errors='coerce')
+
+        # If y_train has NaNs after coercion, drop them.
+        keep = y_train.notna()
+        if not bool(keep.all()):
+            X_train_raw = X_train_raw.loc[keep]
+            y_train = y_train.loc[keep]
+        if y_train.empty:
+            continue
+
+        X_missing_raw = imputed.loc[missing_mask, predictors]
+
+        X_train, X_missing = _make_design_matrices(X_train_raw, X_missing_raw)
+
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+        imputed.loc[missing_mask, col] = model.predict(X_missing)
+
+    return imputed
+
+
+def apply_clinical_bounds(df: pd.DataFrame) -> pd.DataFrame:
+    """Clip key numeric columns to simple physiologic bounds.
+
+    This reduces tail explosions and keeps synthesis/training more stable.
+    """
+
+    out = df.copy()
+    for col, (lo, hi) in CLINICAL_BOUNDS.items():
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors='coerce').clip(lower=lo, upper=hi)
+    return out
 
 
 def _strip_and_nan(s: pd.Series) -> pd.Series:
@@ -122,7 +198,6 @@ def map_target(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_preprocessor(cont_cols: list[str], ord_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
     cont_pipe = Pipeline([
-        ('imputer', IterativeImputer(random_state=0, max_iter=10)),
         ('scaler', StandardScaler()),
     ])
 
@@ -188,6 +263,7 @@ def main() -> None:
     df = load_and_tidy(args.raw_path)
     df = coerce_numeric(df)
     df = normalize_categoricals(df)
+    df = apply_clinical_bounds(df)
     df = map_target(df)
 
     ensure_dir(Path(CLEANED_DATA_PATH).parent)
@@ -210,6 +286,28 @@ def main() -> None:
     X_test.to_csv(split_dir / 'X_test_raw.csv', index=False)
     y_train.to_csv(split_dir / 'y_train.csv', index=False, header=True)
     y_test.to_csv(split_dir / 'y_test.csv', index=False, header=True)
+
+    # Impute AFTER split (train-only learned), on raw feature space.
+    # Learn imputers from the *observed* training split to avoid leakage.
+    X_train_learn = X_train.copy()
+    X_train = model_based_impute(X_train_learn, X_train)
+    X_test = model_based_impute(X_train_learn, X_test)
+
+    # Optional: clip again after imputation to ensure physiologic plausibility.
+    X_train = apply_clinical_bounds(X_train)
+    X_test = apply_clinical_bounds(X_test)
+
+    # Save raw-imputed splits for counterfactual / clinical interpretability work
+    X_train.to_csv(split_dir / 'X_train_imputed_raw.csv', index=False)
+    X_test.to_csv(split_dir / 'X_test_imputed_raw.csv', index=False)
+
+    # Enforce no remaining missing for numeric model features.
+    numeric_cols = [c for c in (CONT_COLS + ORD_COLS) if c in X_train.columns]
+    if X_train[numeric_cols].isna().any().any() or X_test[numeric_cols].isna().any().any():
+        raise ValueError(
+            'Model-based imputation left missing values in numeric columns. '
+            'Check columns with all-missing values or incompatible dtypes.'
+        )
 
     # Build + fit preprocessor on TRAIN only
     cont_cols = [c for c in CONT_COLS if c in X_train.columns]
