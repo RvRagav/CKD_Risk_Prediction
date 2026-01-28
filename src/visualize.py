@@ -92,29 +92,52 @@ def plot_model_comparison(results_dir: Path, output_dir: Path) -> None:
         print('Skipping model comparison: no metrics_*.csv found')
         return
 
-    run_order = list(dict.fromkeys(metrics['run'].tolist()))
+    # Filter to only feat6 for final results
+    metrics = metrics[metrics['run'] == 'feat6'].copy()
+    
+    if metrics.empty:
+        print('Skipping model comparison: no feat6 metrics found')
+        return
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Model Performance Comparison (All Runs)', fontsize=16, fontweight='bold', y=0.995)
+    fig.suptitle('Model Performance Comparison (6-Feature Set)', fontsize=16, fontweight='bold', y=0.98)
 
     plot_metrics = ['roc_auc', 'f1', 'precision', 'recall']
-    titles = ['ROC-AUC', 'F1', 'Precision', 'Recall']
+    titles = ['ROC-AUC', 'F1 Score', 'Precision', 'Recall']
 
     for ax, metric, title in zip(axes.flat, plot_metrics, titles):
-        df = metrics[['model', 'run', metric]].dropna()
+        df = metrics[['model', metric]].dropna()
         if df.empty:
             ax.set_visible(False)
             continue
-        sns.barplot(data=df, x='model', y=metric, hue='run', hue_order=run_order, ax=ax)
-        ax.set_ylabel(title)
-        ax.set_xlabel('Model')
-        ax.set_title(title, fontsize=12, pad=10)
+        
+        # Create bar plot
+        bars = ax.bar(df['model'], df[metric], alpha=0.8, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+        
+        # Set y-axis to show differences clearly
+        y_min = max(0.75, df[metric].min() - 0.05)
+        y_max = min(1.0, df[metric].max() + 0.05)
+        ax.set_ylim([y_min, y_max])
+        
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.4f}',
+                   ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        ax.set_ylabel(title, fontsize=11, fontweight='bold')
+        ax.set_xlabel('Model', fontsize=11, fontweight='bold')
+        ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
         ax.grid(axis='y', alpha=0.3)
-        ax.legend(loc='best', fontsize=8)
+        
+        # Uppercase model names
+        ax.set_xticks(range(len(df['model'])))
+        ax.set_xticklabels([m.upper() for m in df['model']])
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
     output_path = output_dir / 'model_comparison.png'
-    plt.savefig(output_path)
+    plt.savefig(output_path, bbox_inches='tight')
     print(f'Saved: {output_path}')
     plt.close()
 
@@ -337,113 +360,79 @@ def plot_performance_summary(results_dir: Path, output_dir: Path) -> None:
         print('Skipping performance summary: no metrics_*.csv found')
         return
     
-    fig = plt.figure(figsize=(16, 10), constrained_layout=False)
-    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.35, top=0.95, bottom=0.05, left=0.05, right=0.98)
+    # Filter to only feat6 for final results
+    metrics = metrics[metrics['run'] == 'feat6'].copy()
     
-    fig.suptitle('CKD Risk Prediction: Complete Performance Summary', 
-                 fontsize=18, fontweight='bold', y=0.98)
+    if metrics.empty:
+        print('Skipping performance summary: no feat6 metrics found')
+        return
     
-    # Main heatmap
-    ax_main = fig.add_subplot(gs[0:2, 0:2])
+    fig = plt.figure(figsize=(12, 8), constrained_layout=False)
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3, top=0.92, bottom=0.08, left=0.08, right=0.95)
+    
+    fig.suptitle('CKD Risk Prediction: 6-Feature Model Performance', 
+                 fontsize=18, fontweight='bold', y=0.97)
+    
+    # Main heatmap (top-left, spanning 2 columns)
+    ax_main = fig.add_subplot(gs[0, :])
     
     combined = metrics.copy()
-    combined['label'] = combined['model'].astype(str).str.upper() + '\n' + combined['run'].astype(str)
+    combined['model'] = combined['model'].str.upper()
 
     metrics_for_heatmap = ['roc_auc', 'precision', 'recall', 'f1']
-    heatmap_df = combined.pivot_table(index='label', values=metrics_for_heatmap, aggfunc=lambda s: s.iloc[0])
+    heatmap_df = combined.set_index('model')[metrics_for_heatmap]
     heatmap_df = heatmap_df.rename(
         columns={
             'roc_auc': 'ROC-AUC',
             'precision': 'Precision',
             'recall': 'Recall',
-            'f1': 'F1',
+            'f1': 'F1-Score',
         }
     )
 
-    sns.heatmap(heatmap_df, annot=True, fmt='.4f', cmap='RdYlGn', ax=ax_main, cbar_kws={'label': 'Score'})
-    ax_main.set_title('Model Performance Metrics', fontsize=14, fontweight='bold', pad=15)
-    ax_main.set_xlabel('')
-    ax_main.set_ylabel('Model + Run', fontsize=11, fontweight='bold')
+    sns.heatmap(heatmap_df, annot=True, fmt='.4f', cmap='RdYlGn', ax=ax_main, 
+                cbar_kws={'label': 'Score'}, vmin=0.75, vmax=1.0)
+    ax_main.set_title('Model Performance Heatmap', fontsize=14, fontweight='bold', pad=15)
+    ax_main.set_xlabel('Metric', fontsize=11, fontweight='bold')
+    ax_main.set_ylabel('Model', fontsize=11, fontweight='bold')
     
-    # ROC-AUC trend for up to 3 runs
-    ax1 = fig.add_subplot(gs[0, 2])
-
-    runs = list(dict.fromkeys(combined['run'].tolist()))[:3]
+    # ROC-AUC comparison (bottom-left)
+    ax1 = fig.add_subplot(gs[1, 0])
     models = sorted(combined['model'].unique().tolist())
-    x_pos = np.arange(len(models))
-
-    for run in runs:
-        yv = [
-            float(combined[(combined['model'] == m) & (combined['run'] == run)]['roc_auc'].iloc[0])
-            if not combined[(combined['model'] == m) & (combined['run'] == run)].empty else np.nan
-            for m in models
-        ]
-        ax1.plot(x_pos, yv, marker='o', linewidth=2, label=run)
-
-    ax1.set_xticks(x_pos)
-    ax1.set_xticklabels([m.upper() for m in models])
-    ax1.set_ylabel('ROC-AUC', fontweight='bold')
-    ax1.set_title('ROC-AUC', fontsize=12, fontweight='bold')
-    ax1.legend(loc='best', fontsize=8)
-    ax1.grid(alpha=0.3)
+    auc_vals = [combined[combined['model'] == m]['roc_auc'].iloc[0] for m in models]
     
-    # F1 trend
-    ax2 = fig.add_subplot(gs[1, 2])
-
-    for run in runs:
-        yv = [
-            float(combined[(combined['model'] == m) & (combined['run'] == run)]['f1'].iloc[0])
-            if not combined[(combined['model'] == m) & (combined['run'] == run)].empty else np.nan
-            for m in models
-        ]
-        ax2.plot(x_pos, yv, marker='o', linewidth=2, label=run)
-
-    ax2.set_xticks(x_pos)
-    ax2.set_xticklabels([m.upper() for m in models])
-    ax2.set_ylabel('F1 Score', fontweight='bold')
-    ax2.set_title('F1 Score', fontsize=12, fontweight='bold')
-    ax2.legend(loc='best', fontsize=8)
-    ax2.grid(alpha=0.3)
+    bars = ax1.bar(models, auc_vals, alpha=0.8, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    ax1.set_ylim((max(0.75, min(auc_vals) - 0.05), min(1.0, max(auc_vals) + 0.05)))
     
-    # Performance delta between the first two runs (if available)
-    ax3 = fig.add_subplot(gs[2, :])
-
-    if len(runs) >= 2:
-        base_run, other_run = runs[0], runs[1]
-        metrics_to_compare = ['roc_auc', 'precision', 'recall', 'f1']
-        x = np.arange(len(models))
-        width = 0.2
-
-        for i, metric in enumerate(metrics_to_compare):
-            base_vals = np.array([
-                float(combined[(combined['model'] == m) & (combined['run'] == base_run)][metric].iloc[0])
-                if not combined[(combined['model'] == m) & (combined['run'] == base_run)].empty else np.nan
-                for m in models
-            ])
-            other_vals = np.array([
-                float(combined[(combined['model'] == m) & (combined['run'] == other_run)][metric].iloc[0])
-                if not combined[(combined['model'] == m) & (combined['run'] == other_run)].empty else np.nan
-                for m in models
-            ])
-            delta = (other_vals - base_vals) * 100
-            ax3.bar(x + i * width, delta, width, label=metric.upper(), alpha=0.7)
-
-        ax3.set_title(f'Performance Delta (%): {other_run} vs {base_run}', fontsize=12, fontweight='bold')
-        ax3.set_xticks(x + width * 1.5)
-        ax3.set_xticklabels([m.upper() for m in models])
-        ax3.axhline(0, color='black', linestyle='-', linewidth=1)
-        ax3.legend(loc='upper right', ncol=4)
-        ax3.grid(axis='y', alpha=0.3)
-    else:
-        ax3.text(0.5, 0.5, 'Need at least 2 runs for delta plot', ha='center', va='center')
-        ax3.set_axis_off()
+    for bar in bars:
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+               f'{height:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    if len(runs) >= 2:
-        ax3.set_xlabel('Model', fontsize=11, fontweight='bold')
-        ax3.set_ylabel('Performance Change (%)', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('ROC-AUC', fontsize=11, fontweight='bold')
+    ax1.set_xlabel('Model', fontsize=11, fontweight='bold')
+    ax1.set_title('ROC-AUC Comparison', fontsize=12, fontweight='bold')
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # F1 comparison (bottom-right)
+    ax2 = fig.add_subplot(gs[1, 1])
+    f1_vals = [combined[combined['model'] == m]['f1'].iloc[0] for m in models]
+    
+    bars = ax2.bar(models, f1_vals, alpha=0.8, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    ax2.set_ylim((max(0.75, min(f1_vals) - 0.05), min(1.0, max(f1_vals) + 0.05)))
+    
+    for bar in bars:
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height,
+               f'{height:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    ax2.set_ylabel('F1 Score', fontsize=11, fontweight='bold')
+    ax2.set_xlabel('Model', fontsize=11, fontweight='bold')
+    ax2.set_title('F1 Score Comparison', fontsize=12, fontweight='bold')
+    ax2.grid(axis='y', alpha=0.3)
     
     output_path = output_dir / 'performance_summary.png'
-    plt.savefig(output_path)
+    plt.savefig(output_path, bbox_inches='tight', dpi=300)
     print(f'Saved: {output_path}')
     plt.close()
 
