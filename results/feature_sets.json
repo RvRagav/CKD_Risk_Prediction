@@ -1,51 +1,33 @@
 {
-  "feat13_raw": [
-    "hemo",
-    "sg",
-    "rbc",
-    "al",
-    "htn",
-    "pot",
-    "dm",
-    "pcv",
-    "sc",
-    "rbcc",
-    "sod",
-    "age",
-    "bp"
-  ],
-  "feat13_resolved": [
-    "hemo",
-    "sg",
-    "rbc",
-    "al",
-    "htn",
-    "pot",
-    "dm",
-    "pcv",
-    "sc",
-    "rc",
-    "sod",
-    "age",
-    "bp"
-  ],
-  "feat6_raw": [
-    "hemo",
-    "sc",
-    "al",
-    "htn",
-    "age",
-    "dm"
-  ],
-  "feat6_resolved": [
-    "hemo",
-    "sc",
-    "al",
-    "htn",
-    "age",
-    "dm"
-  ],
-  "aliases": {
-    "rbcc": "rc"
+  "feat13": {
+    "name": "13-feature set",
+    "features": [
+      "hemo",
+      "sg",
+      "rbc",
+      "al",
+      "htn",
+      "pot",
+      "dm",
+      "pcv",
+      "sc",
+      "rc",
+      "sod",
+      "age",
+      "bp"
+    ],
+    "n_features": 13
+  },
+  "feat6": {
+    "name": "6-feature set",
+    "features": [
+      "hemo",
+      "sc",
+      "al",
+      "htn",
+      "age",
+      "dm"
+    ],
+    "n_features": 6
   }
 }

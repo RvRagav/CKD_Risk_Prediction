@@ -349,7 +349,7 @@ def plot_performance_summary(results_dir: Path, output_dir: Path) -> None:
     combined = metrics.copy()
     combined['label'] = combined['model'].astype(str).str.upper() + '\n' + combined['run'].astype(str)
 
-    metrics_for_heatmap = ['roc_auc', 'precision', 'recall', 'f1', 'brier', 'ece']
+    metrics_for_heatmap = ['roc_auc', 'precision', 'recall', 'f1']
     heatmap_df = combined.pivot_table(index='label', values=metrics_for_heatmap, aggfunc=lambda s: s.iloc[0])
     heatmap_df = heatmap_df.rename(
         columns={
@@ -357,13 +357,11 @@ def plot_performance_summary(results_dir: Path, output_dir: Path) -> None:
             'precision': 'Precision',
             'recall': 'Recall',
             'f1': 'F1',
-            'brier': 'Brier',
-            'ece': 'ECE',
         }
     )
 
     sns.heatmap(heatmap_df, annot=True, fmt='.4f', cmap='RdYlGn', ax=ax_main, cbar_kws={'label': 'Score'})
-    ax_main.set_title('Performance + Calibration Heatmap', fontsize=14, fontweight='bold', pad=15)
+    ax_main.set_title('Model Performance Metrics', fontsize=14, fontweight='bold', pad=15)
     ax_main.set_xlabel('')
     ax_main.set_ylabel('Model + Run', fontsize=11, fontweight='bold')
     
@@ -471,14 +469,15 @@ def main() -> None:
     print('\n1. Generating model comparison plots...')
     plot_model_comparison(results_dir, output_dir)
     
-    print('\n2. Generating synthetic quality assessment...')
-    plot_synthetic_quality(results_dir, output_dir, synth_tag=args.synth_tag)
-    
-    print('\n3. Generating feature distribution comparisons...')
-    plot_feature_distributions(data_dir, results_dir, output_dir)
-    
-    print('\n4. Generating performance summary...')
+    print('\n2. Generating performance summary...')
     plot_performance_summary(results_dir, output_dir)
+    
+    # Synthetic data quality and feature distributions can be added later
+    # print('\n3. Generating synthetic quality assessment...')
+    # plot_synthetic_quality(results_dir, output_dir, synth_tag=args.synth_tag)
+    # 
+    # print('\n4. Generating feature distribution comparisons...')
+    # plot_feature_distributions(data_dir, results_dir, output_dir)
     
     print('\n' + '=' * 60)
     print(f'✓ All visualizations saved to: {output_dir}')
