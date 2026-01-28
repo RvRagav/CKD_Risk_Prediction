@@ -1,2 +1,0 @@
-multiplier,seed,backend,mean_abs_corr_diff,real_vs_synth_auc,mean_ks_p,median_ks_p
-1,0,sdv_gcopula,0.0826685005351492,0.9802001953125,0.6250880901857642,0.9947234517421417
