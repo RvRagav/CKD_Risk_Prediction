@@ -1,0 +1,7 @@
+Metric,Real Data,Synthetic Data
+Dataset Size,400,840
+Number of Features,34,34
+Mean Correlation,-0.0174,-0.0186
+Std Dev Correlation,0.3218,0.2830
+Max Correlation,0.8985,0.9004
+Min Correlation,-1.0000,-1.0000
