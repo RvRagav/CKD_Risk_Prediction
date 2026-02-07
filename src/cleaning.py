@@ -8,11 +8,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 
 # Allow running as: python src/cleaning.py
@@ -39,6 +37,12 @@ from src.config import (  # noqa: E402
     PREPROC_DIR,
 )
 from src.utils import ensure_dir, save_json  # noqa: E402
+from src.canonical import (  # noqa: E402
+    CANONICAL_FEATURES,
+    CanonicalPreprocessor,
+    assert_canonical_schema,
+    forbid_onehot_residuals,
+)
 
 
 def model_based_impute(train_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFrame:
@@ -196,61 +200,36 @@ def map_target(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_preprocessor(cont_cols: list[str], ord_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
-    cont_pipe = Pipeline([
-        ('scaler', StandardScaler()),
-    ])
+def _save_canonical_preprocessed(
+    X_train_raw: pd.DataFrame,
+    X_test_raw: pd.DataFrame,
+) -> None:
+    """Create canonical, leakage-safe preprocessed splits.
 
-    # sklearn changed arg name from sparse->sparse_output
-    try:
-        ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown='ignore', sparse=False)
+    - Select ONLY CANONICAL_FEATURES
+    - Binary encode dm/htn
+    - Median/mode imputation learned on TRAIN only
+    - No StandardScaler / no OneHotEncoder
+    """
 
-    cat_pipe = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('onehot', ohe),
-    ])
+    preproc = CanonicalPreprocessor().fit(X_train_raw)
+    X_train_proc = preproc.transform(X_train_raw)
+    X_test_proc = preproc.transform(X_test_raw)
 
-    used_num_cols = [c for c in (cont_cols + ord_cols) if c is not None]
-    used_cat_cols = [c for c in cat_cols if c is not None]
+    # Hard safety checks required by spec
+    assert_canonical_schema(X_train_proc)
+    assert_canonical_schema(X_test_proc)
+    forbid_onehot_residuals(list(X_train_proc.columns))
+    forbid_onehot_residuals(list(X_test_proc.columns))
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('cont', cont_pipe, used_num_cols),
-            ('cat', cat_pipe, used_cat_cols),
-        ],
-        remainder='drop',
-        verbose_feature_names_out=False,
-    )
-    return preprocessor
+    preproc_dir = ensure_dir(PREPROC_DIR)
+    pd.DataFrame(X_train_proc, columns=CANONICAL_FEATURES).to_csv(preproc_dir / 'X_train_preproc.csv', index=False)
+    pd.DataFrame(X_test_proc, columns=CANONICAL_FEATURES).to_csv(preproc_dir / 'X_test_preproc.csv', index=False)
+    save_json(CANONICAL_FEATURES, preproc_dir / 'feature_names.json')
 
-
-def get_feature_names(preprocessor: ColumnTransformer) -> list[str]:
-    if hasattr(preprocessor, 'get_feature_names_out'):
-        return list(preprocessor.get_feature_names_out())
-
-    # Fallback for very old sklearn
-    names: list[str] = []
-    for name, trans, cols in preprocessor.transformers_:
-        if name == 'remainder' and trans == 'drop':
-            continue
-        if hasattr(trans, 'get_feature_names_out'):
-            try:
-                out = trans.get_feature_names_out(cols)
-            except TypeError:
-                out = trans.get_feature_names_out()
-            names.extend(list(out))
-        else:
-            names.extend(list(cols))
-    return names
-
-
-def _to_dense(matrix) -> np.ndarray:
-    # ColumnTransformer/OneHotEncoder can produce sparse matrices depending on sklearn version.
-    if hasattr(matrix, 'toarray'):
-        return np.asarray(matrix.toarray())
-    return np.asarray(matrix)
+    # Save fitted canonical preprocessor for reuse (synthetic, inference)
+    ensure_dir(Path(PREPROCESSOR_PATH).parent)
+    joblib.dump(preproc, PREPROCESSOR_PATH)
 
 
 def main() -> None:
@@ -287,58 +266,23 @@ def main() -> None:
     y_train.to_csv(split_dir / 'y_train.csv', index=False, header=True)
     y_test.to_csv(split_dir / 'y_test.csv', index=False, header=True)
 
-    # Impute AFTER split (train-only learned), on raw feature space.
-    # Learn imputers from the *observed* training split to avoid leakage.
+    # Optional artifact (kept for backward compatibility / analysis):
+    # regression-based imputation on the full raw space.
     X_train_learn = X_train.copy()
-    X_train = model_based_impute(X_train_learn, X_train)
-    X_test = model_based_impute(X_train_learn, X_test)
+    X_train_imp = model_based_impute(X_train_learn, X_train)
+    X_test_imp = model_based_impute(X_train_learn, X_test)
+    X_train_imp = apply_clinical_bounds(X_train_imp)
+    X_test_imp = apply_clinical_bounds(X_test_imp)
+    X_train_imp.to_csv(split_dir / 'X_train_imputed_raw.csv', index=False)
+    X_test_imp.to_csv(split_dir / 'X_test_imputed_raw.csv', index=False)
 
-    # Optional: clip again after imputation to ensure physiologic plausibility.
-    X_train = apply_clinical_bounds(X_train)
-    X_test = apply_clinical_bounds(X_test)
-
-    # Save raw-imputed splits for counterfactual / clinical interpretability work
-    X_train.to_csv(split_dir / 'X_train_imputed_raw.csv', index=False)
-    X_test.to_csv(split_dir / 'X_test_imputed_raw.csv', index=False)
-
-    # Enforce no remaining missing for numeric model features.
-    numeric_cols = [c for c in (CONT_COLS + ORD_COLS) if c in X_train.columns]
-    if X_train[numeric_cols].isna().any().any() or X_test[numeric_cols].isna().any().any():
-        raise ValueError(
-            'Model-based imputation left missing values in numeric columns. '
-            'Check columns with all-missing values or incompatible dtypes.'
-        )
-
-    # Build + fit preprocessor on TRAIN only
-    cont_cols = [c for c in CONT_COLS if c in X_train.columns]
-    ord_cols = [c for c in ORD_COLS if c in X_train.columns]
-    cat_cols = [c for c in CAT_COLS if c in X_train.columns]
-
-    preprocessor = build_preprocessor(cont_cols, ord_cols, cat_cols)
-    preprocessor.fit(X_train)
-
-    # Transform
-    X_train_proc = preprocessor.transform(X_train)
-    X_test_proc = preprocessor.transform(X_test)
-
-    X_train_proc = _to_dense(X_train_proc)
-    X_test_proc = _to_dense(X_test_proc)
-
-    feature_names = get_feature_names(preprocessor)
-
-    preproc_dir = ensure_dir(PREPROC_DIR)
-    pd.DataFrame(X_train_proc, columns=feature_names).to_csv(preproc_dir / 'X_train_preproc.csv', index=False)
-    pd.DataFrame(X_test_proc, columns=feature_names).to_csv(preproc_dir / 'X_test_preproc.csv', index=False)
-    save_json(feature_names, preproc_dir / 'feature_names.json')
-
-    # Save fitted preprocessor
-    ensure_dir(Path(PREPROCESSOR_PATH).parent)
-    joblib.dump(preprocessor, PREPROCESSOR_PATH)
+    # Canonical, base-paper representation for training + inference (MANDATORY)
+    _save_canonical_preprocessed(X_train_imp, X_test_imp)
 
     print('Saved cleaned dataset:', CLEANED_DATA_PATH)
     print('Saved raw splits to:', split_dir)
-    print('Saved preprocessed splits to:', preproc_dir)
-    print('Saved preprocessor to:', PREPROCESSOR_PATH)
+    print('Saved canonical preprocessed splits to:', PREPROC_DIR)
+    print('Saved canonical preprocessor to:', PREPROCESSOR_PATH)
 
 
 if __name__ == '__main__':

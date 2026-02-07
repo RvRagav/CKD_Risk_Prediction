@@ -15,6 +15,29 @@ The primary documentation is in the notebooks under notebooks/.
   - Uses **cross-validation (CV) metrics** for tables and plots.
   - Saves the trained augmented models into models/.
 
+## Explanations (SHAP + LIME)
+
+For the canonical explanation notebook:
+
+- [notebooks/CKD_Model_Explanations.ipynb](notebooks/CKD_Model_Explanations.ipynb)
+
+Important environment note (XGBoost SHAP):
+
+- If you are using **XGBoost >= 3.1**, you should run this notebook with **SHAP >= 0.50**.
+- This repo includes a ready-to-use conda env/kernel setup that installs `shap==0.50.0` under **Python 3.11**.
+
+Steps (VS Code):
+
+- In the notebook, use the kernel picker and select: `ckd-shap50 (Python 3.11)`
+- Restart the kernel, then **Run All** (or run cells top-to-bottom)
+
+If you don't see that kernel option, recreate it:
+
+- `conda create -n ckd-shap50 python=3.11`
+- `conda activate ckd-shap50`
+- `pip install -r requirements.txt shap==0.50.0 ipykernel`
+- `python -m ipykernel install --user --name ckd-shap50 --display-name "ckd-shap50 (Python 3.11)"`
+
 ## Workflow (Project Flow)
 
 1. Data source

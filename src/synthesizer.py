@@ -17,7 +17,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import (
-    CAT_COLS,
     CLINICAL_BOUNDS,
     HIGH_RISK_NUMERIC,
     ORD_COLS,
@@ -28,6 +27,12 @@ from src.config import (
     PREPROC_DIR,
 )
 from src.utils import ensure_dir
+from src.canonical import (
+    CANONICAL_FEATURES,
+    CanonicalPreprocessor,
+    assert_canonical_schema,
+    forbid_onehot_residuals,
+)
 
 # -------------------------------------------------------------------------
 #  1. Native Gaussian Copula Implementation
@@ -66,15 +71,13 @@ class GaussianCopulaGenerator:
                 df_encoded[col] = df_encoded[col].fillna(fill_val)
                 self.imputers[col] = fill_val
 
-        # --- STEP 2: ENCODE CATEGORICALS ---
+        # --- STEP 2: ENCODE CATEGORICALS (kept for completeness) ---
+        # Canonical synthesis uses numeric/binary columns, so this usually no-ops.
         for col in df_encoded.columns:
-            if df_encoded[col].dtype == 'object' or col in CAT_COLS:
-                # Store unique values for decoding
+            if df_encoded[col].dtype == 'object':
                 unique_vals = np.sort(df_encoded[col].unique())
                 mapping = {val: idx for idx, val in enumerate(unique_vals)}
                 self.categorical_mappings[col] = {idx: val for val, idx in mapping.items()}
-                
-                # Apply mapping
                 df_encoded[col] = df_encoded[col].map(mapping)
 
         # Convert to dense matrix (No dropna needed now!)
@@ -182,6 +185,14 @@ def postprocess_synth(X_synth: pd.DataFrame, X_ref: pd.DataFrame) -> pd.DataFram
         if col in out.columns:
             out[col] = out[col].clip(lo, hi)
 
+    # 1b. Force binary clinical flags to {0,1}
+    for col in ['htn', 'dm']:
+        if col in out.columns:
+            x = pd.to_numeric(out[col], errors='coerce')
+            # If generator produced continuous values, threshold at 0.5
+            x = (x >= 0.5).astype(int)
+            out[col] = x
+
     # 2. Snap ordinal columns (e.g., stages 1,2,3) to integers
     for col in ORD_COLS:
         if col in out.columns and col in X_ref.columns:
@@ -219,24 +230,14 @@ def _load_y_train() -> np.ndarray:
     path = split_dir / 'y_train.csv'
     return pd.read_csv(path)[TARGET_COL].to_numpy()
 
-def _preprocess_for_model(X_raw: pd.DataFrame) -> pd.DataFrame:
-    """Applies the saved sklearn preprocessor (StandardScaler/OneHot)."""
+def _load_canonical_preprocessor() -> CanonicalPreprocessor:
     preproc = joblib.load(PREPROCESSOR_PATH)
-    
-    # Transform
-    X_arr = preproc.transform(X_raw)
-    
-    # Handle sparse vs dense
-    if hasattr(X_arr, 'toarray'):
-        X_arr = X_arr.toarray()
-    
-    # Try to get feature names
-    try:
-        cols = list(preproc.get_feature_names_out())
-    except Exception:
-        cols = [f'f{i}' for i in range(X_arr.shape[1])]
-        
-    return pd.DataFrame(X_arr, columns=cols)
+    if not isinstance(preproc, CanonicalPreprocessor):
+        raise TypeError(
+            'Saved preprocessor is not CanonicalPreprocessor. '
+            'Re-run: python src/cleaning.py to regenerate canonical artifacts.'
+        )
+    return preproc
 
 def _load_preprocessed_train() -> pd.DataFrame:
     """Used only for QC comparison."""
@@ -286,27 +287,30 @@ def main():
     parser = argparse.ArgumentParser(description='Gaussian Copula Synthesizer (Native)')
     parser.add_argument('--multiplier', type=int, default=1, help='Size multiplier relative to train set')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--backend', type=str, default='gcopula', choices=['gcopula'])
     args = parser.parse_args()
 
-    # 1. Load Data
-    X_train = _load_imputed_train()
+    # 1. Load Data (raw-imputed), then STRICTLY filter to canonical feature set
+    X_train_full = _load_imputed_train()
+    X_train = X_train_full[CANONICAL_FEATURES].copy()
     y_train = _load_y_train()
     
     n_synth = len(X_train) * args.multiplier
     
     print(f"\n--- Starting Synthesis (Gaussian Copula) ---\nTarget size: {n_synth} samples")
 
-    # 2. Synthesize (Raw Feature Space)
-    #    We generate synthetic data in the Raw/Imputed space, NOT the One-Hot space.
-    #    This allows us to respect physical bounds (e.g. Blood Pressure > 0) easily.
+    # 2. Synthesize in canonical feature space ONLY.
     X_synth_raw, y_synth = generate_by_class(X_train, y_train, n_synth, args.seed)
 
-    # 3. Post-Process (Bounds & Snapping)
+    # 3. Post-Process (Bounds & Binary Flags)
     X_synth_raw = postprocess_synth(X_synth_raw, X_train)
 
-    # 4. Transform (Apply Preprocessor)
-    #    The machine learning models expect the preprocessed (OHE/Scaled) data.
-    X_synth_preproc = _preprocess_for_model(X_synth_raw)
+    # 4. Canonical preprocessing (same fitted preprocessor as real training)
+    preproc = _load_canonical_preprocessor()
+    X_synth_preproc = preproc.transform(X_synth_raw)
+
+    forbid_onehot_residuals(list(X_synth_preproc.columns))
+    assert_canonical_schema(X_synth_preproc)
 
     # 5. Save
     out_dir = ensure_dir(SYNTH_DIR)
@@ -329,8 +333,10 @@ def main():
     
     # Load real preprocessed data for comparison
     X_real_preproc = _load_preprocessed_train()
+    forbid_onehot_residuals(list(X_real_preproc.columns))
+    assert_canonical_schema(X_real_preproc)
     
-    common_cols = [c for c in X_real_preproc.columns if c in X_synth_preproc.columns]
+    common_cols = CANONICAL_FEATURES.copy()
     
     # Metric 1: KS Test (Distribution similarity)
     # Lower statistic = distributions are more similar
@@ -344,7 +350,6 @@ def main():
     print(f"Average KS Statistic: {avg_ks:.4f} (Lower is better)")
     
     # Metric 2: Correlation Structure Preservation
-    # Compare correlation matrices
     corr_real = X_real_preproc[common_cols].corr()
     corr_synth = X_synth_preproc[common_cols].corr()
     diff_matrix = (corr_real - corr_synth).abs()
@@ -352,7 +357,6 @@ def main():
     print(f"Mean Absolute Correlation Difference: {mean_corr_diff:.4f} (Lower is better)")
 
     # Metric 3: Discriminator AUC (Can a classifier tell real from fake?)
-    # AUC ~ 0.5 is ideal (indistinguishable). AUC > 0.8 means synthesis is easily detectable.
     Z = pd.concat([
         X_real_preproc[common_cols].assign(is_real=1),
         X_synth_preproc[common_cols].assign(is_real=0)

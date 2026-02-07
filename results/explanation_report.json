@@ -1,0 +1,46 @@
+{
+    "models_to_run": [
+        "lr",
+        "rf",
+        "xgb"
+    ],
+    "report_model_key": "lr",
+    "ess_by_model": {
+        "lr": {
+            "real": 0.8095238095238096,
+            "augmented": 0.7142857142857143
+        },
+        "rf": {
+            "real": 0.4285714285714286,
+            "augmented": 0.08571428571428573
+        },
+        "xgb": {
+            "real": 0.8571428571428572,
+            "augmented": -0.08571428571428573
+        }
+    },
+    "mean_abs_rank_difference_report_model": 1.1666666666666667,
+    "top_5_rank_changes_report_model": {
+        "real_rank": {
+            "Serum Creatinine": 2.0,
+            "HTN=1.0": 5.0,
+            "Age": 7.0,
+            "AL": 3.0,
+            "DM=1.0": 4.0
+        },
+        "augmented_rank": {
+            "Serum Creatinine": 4.0,
+            "HTN=1.0": 3.0,
+            "Age": 6.0,
+            "AL": 2.0,
+            "DM=1.0": 5.0
+        },
+        "rank_diff": {
+            "Serum Creatinine": 2.0,
+            "HTN=1.0": 2.0,
+            "Age": 1.0,
+            "AL": 1.0,
+            "DM=1.0": 1.0
+        }
+    }
+}

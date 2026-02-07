@@ -15,6 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.config import PREPROC_DIR, RESULTS_DIR  # noqa: E402
 from src.utils import ensure_dir  # noqa: E402
+from src.canonical import (  # noqa: E402
+    CANONICAL_FEATURES,
+    assert_canonical_schema,
+    forbid_onehot_residuals,
+)
 
 
 def main() -> None:
@@ -24,6 +29,10 @@ def main() -> None:
     args = parser.parse_args()
 
     X_test = pd.read_csv(Path(PREPROC_DIR) / 'X_test_preproc.csv')
+    forbid_onehot_residuals(list(X_test.columns))
+    assert_canonical_schema(X_test)
+    X_test = X_test[CANONICAL_FEATURES].copy()
+    assert_canonical_schema(X_test)
 
     model_path = Path('models') / f'{args.model}_{args.variant}.joblib'
     if not model_path.exists():

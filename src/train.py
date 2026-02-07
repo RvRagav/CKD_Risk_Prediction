@@ -10,7 +10,6 @@ import pandas as pd
 
 from typing import Literal, cast
 
-from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -19,19 +18,85 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 # Allow running as: python src/train.py
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import CAT_COLS, CONT_COLS, ORD_COLS, PREPROC_DIR, RESULTS_DIR, SPLIT_DIR  # noqa: E402
+from src.config import PREPROC_DIR, RESULTS_DIR, SPLIT_DIR  # noqa: E402
 from src.cleaning import apply_clinical_bounds, model_based_impute  # noqa: E402
+from src.canonical import (  # noqa: E402
+    CANONICAL_FEATURES,
+    CanonicalPreprocessor,
+    assert_canonical_schema,
+    forbid_onehot_residuals,
+)
 from src.utils import ensure_dir  # noqa: E402
+
+
+def _synth_fold_gcopula_canonical(
+    X_train_canon: pd.DataFrame,
+    y_train: np.ndarray,
+    multiplier: int,
+    seed: int,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Generate fold-local synthetic samples in canonical feature space.
+
+    This avoids leakage versus using a synthetic dataset generated from the full
+    training split (which would indirectly encode validation-fold information).
+    """
+
+    # Local import to avoid heavy deps during baseline runs.
+    from src.synthesizer import GaussianCopulaGenerator, postprocess_synth  # noqa: WPS433
+
+    assert_canonical_schema(X_train_canon)
+    forbid_onehot_residuals(list(X_train_canon.columns))
+
+    n_total = int(len(X_train_canon) * int(multiplier))
+    if n_total <= 0:
+        raise ValueError('multiplier must yield at least 1 synthetic sample')
+
+    rng = np.random.default_rng(int(seed))
+
+    X0 = X_train_canon[y_train == 0].reset_index(drop=True)
+    X1 = X_train_canon[y_train == 1].reset_index(drop=True)
+    if X0.empty or X1.empty:
+        raise ValueError('Cannot synthesize per-class: one class has zero samples in this fold.')
+
+    p1 = float(len(X1) / len(y_train))
+    n1 = int(round(n_total * p1))
+    n0 = int(n_total - n1)
+    if n0 <= 0 or n1 <= 0:
+        # Keep both classes represented
+        n0 = max(1, n0)
+        n1 = max(1, n_total - n0)
+
+    cop0 = GaussianCopulaGenerator()
+    cop0.fit(X0)
+    Xs0 = cop0.sample(n0, seed=int(seed))
+
+    cop1 = GaussianCopulaGenerator()
+    cop1.fit(X1)
+    Xs1 = cop1.sample(n1, seed=int(seed) + 1)
+
+    Xs = pd.concat([Xs0, Xs1], ignore_index=True)
+    ys = np.concatenate([np.zeros(n0, dtype=int), np.ones(n1, dtype=int)])
+
+    perm = rng.permutation(len(Xs))
+    Xs = Xs.iloc[perm].reset_index(drop=True)
+    ys = ys[perm]
+
+    # Postprocess for bounds + binary flags, then re-apply canonical preprocessor to enforce dtypes/order
+    Xs = postprocess_synth(Xs, X_train_canon)
+    pre = CanonicalPreprocessor().fit(X_train_canon)
+    Xs = pre.transform(Xs)
+
+    assert_canonical_schema(Xs)
+    forbid_onehot_residuals(list(Xs.columns))
+    return Xs, ys
 
 
 def _row_hashes(df: pd.DataFrame) -> set[int]:
@@ -60,6 +125,11 @@ def _load_split_preproc() -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.nd
     split_dir = Path('data/processed/splits')
     y_train = pd.read_csv(split_dir / 'y_train.csv')['target'].to_numpy()
     y_test = pd.read_csv(split_dir / 'y_test.csv')['target'].to_numpy()
+
+    forbid_onehot_residuals(list(X_train.columns))
+    forbid_onehot_residuals(list(X_test.columns))
+    assert_canonical_schema(X_train)
+    assert_canonical_schema(X_test)
     return X_train, X_test, y_train, y_test
 
 
@@ -70,71 +140,70 @@ def _load_split_raw_train() -> tuple[pd.DataFrame, np.ndarray]:
     return X_train, y_train
 
 
-def _build_preprocessor_from_X(X: pd.DataFrame) -> ColumnTransformer:
-    cont_cols = [c for c in CONT_COLS if c in X.columns]
-    ord_cols = [c for c in ORD_COLS if c in X.columns]
-    cat_cols = [c for c in CAT_COLS if c in X.columns]
-
-    num_cols = cont_cols + ord_cols
-    cont_pipe = Pipeline([
-        ('scaler', StandardScaler()),
-    ])
-
-    try:
-        ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown='ignore', sparse=False)
-
-    cat_pipe = Pipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('onehot', ohe),
-    ])
-
-    return ColumnTransformer(
-        transformers=[
-            ('num', cont_pipe, num_cols),
-            ('cat', cat_pipe, cat_cols),
-        ],
-        remainder='drop',
-        verbose_feature_names_out=False,
-    )
-
-
 def _cv_evaluate_baseline_raw(
     X_raw: pd.DataFrame,
     y: np.ndarray,
     n_splits: int = 5,
     random_state: int = 0,
+    *,
+    variant: str = 'baseline',
+    synth_backend: str = 'gcopula',
 ) -> pd.DataFrame:
-    """Strict CV on raw features with fold-local imputation+preprocessing (no leakage)."""
+    """Strict CV in canonical feature space with fold-local preprocessing (no leakage).
+
+    For augmented variants (1x/3x), this performs fold-local synthesis using
+    the specified backend so that the validation fold is not used to generate
+    synthetic samples.
+    """
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
     def _fold_scores(estimator_factory, model_name: str) -> dict[str, object]:
         fold_metrics: list[dict[str, float]] = []
-        for train_idx, val_idx in skf.split(X_raw, y):
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_raw, y)):
             X_tr = X_raw.iloc[train_idx].copy()
             y_tr = y[train_idx]
             X_va = X_raw.iloc[val_idx].copy()
             y_va = y[val_idx]
 
-            # Fold-local imputation learned from X_tr only (no leakage)
+            # Fold-local regression imputation learned from fold-train only (paper-aligned)
             X_tr_learn = X_tr.copy()
-            X_tr = model_based_impute(X_tr_learn, X_tr)
-            X_va = model_based_impute(X_tr_learn, X_va)
-            X_tr = apply_clinical_bounds(X_tr)
-            X_va = apply_clinical_bounds(X_va)
+            X_tr_imp = model_based_impute(X_tr_learn, X_tr)
+            X_va_imp = model_based_impute(X_tr_learn, X_va)
 
-            preprocessor = _build_preprocessor_from_X(X_tr)
+            # Bounds after imputation
+            X_tr_imp = apply_clinical_bounds(X_tr_imp)
+            X_va_imp = apply_clinical_bounds(X_va_imp)
+
+            # Fold-local canonical preprocessing (fit on fold-train only)
+            preproc = CanonicalPreprocessor().fit(X_tr_imp)
+            X_tr_c = preproc.transform(X_tr_imp)
+            X_va_c = preproc.transform(X_va_imp)
+
+            # Hard safety checks required by spec
+            assert_canonical_schema(X_tr_c)
+            assert_canonical_schema(X_va_c)
+
+            # Optional: fold-local augmentation in canonical space
+            if variant in ('1x', '3x'):
+                mult = 1 if variant == '1x' else 3
+                if synth_backend != 'gcopula':
+                    raise ValueError(
+                        "Only 'gcopula' fold-local synthesis is supported for CV. "
+                        f"Got synth_backend={synth_backend!r}."
+                    )
+                fold_seed = int(random_state) * 10_000 + int(fold_idx)
+                Xs, ys = _synth_fold_gcopula_canonical(X_tr_c, y_tr, multiplier=mult, seed=fold_seed)
+                X_tr_fit = pd.concat([X_tr_c, Xs], ignore_index=True)
+                y_tr_fit = np.concatenate([y_tr, ys])
+                assert_canonical_schema(X_tr_fit)
+            else:
+                X_tr_fit = X_tr_c
+                y_tr_fit = y_tr
+
             base = estimator_factory()
-
-            pipe = Pipeline([
-                ('preprocess', preprocessor),
-                ('model', base),
-            ])
-
-            pipe.fit(X_tr, y_tr)
-            y_prob = pipe.predict_proba(X_va)[:, 1]
+            base.fit(X_tr_fit, y_tr_fit)
+            y_prob = base.predict_proba(X_va_c)[:, 1]
             fold_metrics.append(_metrics(y_va, y_prob))
 
         df = pd.DataFrame(fold_metrics)
@@ -165,7 +234,6 @@ def _cv_evaluate_baseline_raw(
                 learning_rate=0.05,
                 random_state=0,
                 eval_metric='logloss',
-                use_label_encoder=False,
             )
 
         rows.append(_fold_scores(_xgb, 'xgb'))
@@ -176,27 +244,64 @@ def _cv_evaluate_baseline_raw(
 
 
 def _load_synth(multiplier: int) -> pd.DataFrame:
-    path = Path('data/synthetic') / f'X_synth_{multiplier}x_preproc.csv'
-    if not path.exists():
-        raise FileNotFoundError(f"Missing {path}. Run src/synthesizer.py --multiplier {multiplier} first.")
-    return pd.read_csv(path)
+    candidates = [
+        Path('data/synthetic') / f'X_synth_{multiplier}x_preproc.csv',
+        Path('data/synthetic') / f'X_synth_{multiplier}x_gcopula_preproc.csv',
+    ]
+    for path in candidates:
+        if path.exists():
+            X = pd.read_csv(path)
+            forbid_onehot_residuals(list(X.columns))
+            assert_canonical_schema(X)
+            return X
+    raise FileNotFoundError(
+        f"Missing synthetic preprocessed file for {multiplier}x. Tried: "
+        + ', '.join(str(p) for p in candidates)
+        + f". Run src/synthesizer.py --multiplier {multiplier} first."
+    )
 
 
 def _load_y_synth(multiplier: int) -> np.ndarray:
-    path = Path('data/synthetic') / f'y_synth_{multiplier}x.csv'
-    if not path.exists():
-        raise FileNotFoundError(f"Missing {path}. Run src/synthesizer.py --multiplier {multiplier} first.")
-    return pd.read_csv(path)['target'].to_numpy()
+    candidates = [
+        Path('data/synthetic') / f'y_synth_{multiplier}x.csv',
+        Path('data/synthetic') / f'y_synth_{multiplier}x_gcopula.csv',
+    ]
+    for path in candidates:
+        if path.exists():
+            return pd.read_csv(path)['target'].to_numpy()
+    raise FileNotFoundError(
+        f"Missing synthetic y file for {multiplier}x. Tried: " + ', '.join(str(p) for p in candidates)
+    )
 
 
 def _load_synth_with_backend(multiplier: int, backend: str) -> tuple[pd.DataFrame, np.ndarray]:
-    X_path = Path('data/synthetic') / f'X_synth_{multiplier}x_{backend}_preproc.csv'
-    y_path = Path('data/synthetic') / f'y_synth_{multiplier}x_{backend}.csv'
-    if not X_path.exists() or not y_path.exists():
+    # Backward/forward compatible loader. Canonical schema is enforced.
+    x_candidates = [
+        Path('data/synthetic') / f'X_synth_{multiplier}x_{backend}_preproc.csv',
+        Path('data/synthetic') / f'X_synth_{multiplier}x_gcopula_preproc.csv',
+        Path('data/synthetic') / f'X_synth_{multiplier}x_preproc.csv',
+    ]
+    y_candidates = [
+        Path('data/synthetic') / f'y_synth_{multiplier}x_{backend}.csv',
+        Path('data/synthetic') / f'y_synth_{multiplier}x_gcopula.csv',
+        Path('data/synthetic') / f'y_synth_{multiplier}x.csv',
+    ]
+
+    X_path = next((p for p in x_candidates if p.exists()), None)
+    y_path = next((p for p in y_candidates if p.exists()), None)
+    if X_path is None or y_path is None:
         raise FileNotFoundError(
-            f"Missing {X_path} or {y_path}. Run: python src/synthesizer.py --backend {backend} --multiplier {multiplier}"
+            f"Missing synthetic files for {multiplier}x backend={backend}. Tried X: "
+            + ', '.join(str(p) for p in x_candidates)
+            + ' | y: '
+            + ', '.join(str(p) for p in y_candidates)
         )
-    return pd.read_csv(X_path), pd.read_csv(y_path)['target'].to_numpy()
+
+    X = pd.read_csv(X_path)
+    forbid_onehot_residuals(list(X.columns))
+    assert_canonical_schema(X)
+    y = pd.read_csv(y_path)['target'].to_numpy()
+    return X, y
 
 
 def _metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float]:
@@ -212,33 +317,39 @@ def _metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train LR/RF/XGB on baseline or augmented preprocessed data.')
     parser.add_argument('--variant', type=str, default='baseline', choices=['baseline', '1x', '3x'])
-    parser.add_argument('--synth-backend', type=str, default='sdv_gcopula', choices=['native', 'sdv_gcopula', 'sdv_ctgan'])
+    parser.add_argument('--synth-backend', type=str, default='gcopula', choices=['gcopula', 'native', 'sdv_gcopula', 'sdv_ctgan'])
     parser.add_argument('--cv-folds', type=int, default=5)
     args = parser.parse_args()
 
     if args.variant != 'baseline':
         print('WARNING: Synthetic data used ONLY for robustness testing, not explanation attribution.')
 
-    # Strict CV (baseline only) to avoid overly optimistic single split performance.
-    if args.variant == 'baseline' and args.cv_folds and args.cv_folds >= 2:
+    # Strict CV (all variants). Augmented variants use fold-local synthesis to prevent leakage.
+    if args.cv_folds and args.cv_folds >= 2:
         X_raw_train, y_raw_train = _load_split_raw_train()
-        cv_df = _cv_evaluate_baseline_raw(X_raw_train, y_raw_train, n_splits=args.cv_folds)
+        cv_df = _cv_evaluate_baseline_raw(
+            X_raw_train,
+            y_raw_train,
+            n_splits=args.cv_folds,
+            random_state=0,
+            variant=args.variant,
+            synth_backend=args.synth_backend,
+        )
         cv_df.insert(1, 'variant', args.variant)
+        cv_df.insert(2, 'synth_backend', args.synth_backend)
         out_dir = ensure_dir(RESULTS_DIR)
-        out_path = out_dir / 'cv_metrics_baseline.csv'
+        cv_suffix = args.variant if args.variant == 'baseline' else f"{args.variant}_{args.synth_backend}"
+        out_path = out_dir / f'cv_metrics_{cv_suffix}.csv'
         cv_df.to_csv(out_path, index=False)
         print('Saved CV metrics:', out_path)
-        # Print mean ± std compactly
         for _, r in cv_df.iterrows():
             print(
-                f"CV {int(args.cv_folds)}-fold {r['model'].upper()}: "
+                f"CV {int(args.cv_folds)}-fold {r['model'].upper()} ({cv_suffix}): "
                 f"AUC {r['roc_auc_mean']:.4f}±{r['roc_auc_std']:.4f}, "
                 f"F1 {r['f1_mean']:.4f}±{r['f1_std']:.4f}, "
                 f"Precision {r['precision_mean']:.4f}±{r['precision_std']:.4f}, "
                 f"Recall {r['recall_mean']:.4f}±{r['recall_std']:.4f}"
             )
-    elif args.variant != 'baseline':
-        print('Note: Strict CV is computed for baseline only (to prevent leakage with synthetic augmentation).')
 
     X_train, X_test, y_train, y_test = _load_split_preproc()
 
@@ -255,6 +366,18 @@ def main() -> None:
         X_synth, y_synth = _load_synth_with_backend(mult, args.synth_backend)
         X_train_use = pd.concat([X_train, X_synth], ignore_index=True)
         y_train_use = np.concatenate([y_train, y_synth])
+
+    # Required safety check: strict schema and strict order before training
+    forbid_onehot_residuals(list(X_train_use.columns))
+    forbid_onehot_residuals(list(X_test.columns))
+    assert_canonical_schema(X_train_use)
+    assert_canonical_schema(X_test)
+
+    # Explicit feature order enforcement (defensive)
+    X_train_use = X_train_use[CANONICAL_FEATURES].copy()
+    X_test = X_test[CANONICAL_FEATURES].copy()
+    assert_canonical_schema(X_train_use)
+    assert_canonical_schema(X_test)
 
     results = []
 
@@ -283,7 +406,6 @@ def main() -> None:
             learning_rate=0.05,
             random_state=0,
             eval_metric='logloss',
-            use_label_encoder=False,
         )
         xgb.fit(X_train_use, y_train_use)
         y_prob = xgb.predict_proba(X_test)[:, 1]
