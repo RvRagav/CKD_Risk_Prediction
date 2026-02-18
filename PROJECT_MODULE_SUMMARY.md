@@ -303,8 +303,6 @@ Notes:
 
 The notebooks in [notebooks/](notebooks/) are the “start here” experience and largely orchestrate these same steps:
 
-- [notebooks/CKD_Risk_Prediction.ipynb](notebooks/CKD_Risk_Prediction.ipynb)
-- [notebooks/CKD_Training.ipynb](notebooks/CKD_Training.ipynb)
 - [notebooks/CKD_Comparative_Analysis.ipynb](notebooks/CKD_Comparative_Analysis.ipynb)
 - Explanation-focused notebooks such as [notebooks/CKD_Model_Explanations.ipynb](notebooks/CKD_Model_Explanations.ipynb)
 - Additional explanation notebook: [notebooks/CKD_Explanation_Refactored.ipynb](notebooks/CKD_Explanation_Refactored.ipynb)
