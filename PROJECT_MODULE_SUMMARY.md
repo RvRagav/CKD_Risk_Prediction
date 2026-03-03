@@ -254,7 +254,7 @@ How to run:
 - Open either notebook above and run the LIME sections/cells after the models are trained and the processed splits exist under [data/processed/](data/processed/).
 
 ### 3.2 Explanation evaluation: stability metrics
-**Primary implementation:** [src/stability.py](src/stability.py)
+**Primary implementation:** [src/explanation_metrics.py](src/explanation_metrics.py)
 
 What it measures:
 
@@ -267,9 +267,12 @@ Key outputs:
 
 - Stability table (CSV): default is `results/stability.csv`
 
-How to run (CLI):
+How to run:
 
-- `python src/stability.py --glob "results/shap_rf_baseline_seed*.npy" --k 5 --out results/explanation_stability_metrics.csv`
+- Stability metrics are computed in code (functions in `src/explanation_metrics.py`).
+- If you want a CLI for batch stability from multiple saved SHAP files, you can either:
+  - use the notebooks, or
+  - add a small wrapper script that loads `results/shap_*.npy` arrays and calls the metric functions.
 
 Notes:
 
@@ -293,7 +296,7 @@ Notes:
    - `python src/explain.py --model rf --variant baseline`
   - For LIME (notebook-based): run [notebooks/CKD_Model_Explanations.ipynb](notebooks/CKD_Model_Explanations.ipynb) (or [notebooks/CKD_Explanation_Refactored.ipynb](notebooks/CKD_Explanation_Refactored.ipynb))
 5. Stability (only if you have multiple SHAP runs):
-   - `python src/stability.py --glob "results/shap_rf_baseline_seed*.npy" --k 5`
+  - Use `src/explanation_metrics.py` from a notebook or a small wrapper script.
 6. Plots:
    - `python src/visualize.py`
 
