@@ -19,6 +19,7 @@ guarantee a globally optimal counterfactual.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
  
@@ -40,6 +41,28 @@ def _resolve_repo_relative_path(p: str | Path) -> Path:
     if not path.is_absolute():
         path = _repo_root() / path
     return path
+
+
+@lru_cache(maxsize=16)
+def _cached_joblib_load(path_str: str) -> Any:
+    """Cache joblib artifacts (models, preprocessors) across calls.
+
+    This significantly improves responsiveness in interactive apps (e.g., Streamlit)
+    while keeping behavior identical for callers.
+    """
+
+    try:
+        return joblib.load(path_str)
+    except ImportError as e:
+        msg = str(e)
+        if 'pyarrow' in msg.lower() or 'dll load failed' in msg.lower():
+            raise ImportError(
+                "Model loading failed due to a local dependency import error (often `pyarrow` on Windows). "
+                "In conda environments, the most reliable fix is: pip uninstall -y pyarrow; "
+                "then conda install -c conda-forge --force-reinstall pyarrow. "
+                "If you don't need `pyarrow`, uninstall it (pip uninstall -y pyarrow / conda remove -y pyarrow)."
+            ) from e
+        raise
 
 
 # -----------------------------
@@ -106,7 +129,7 @@ def load_model(model_path: str | Path) -> Any:
     path = _resolve_repo_relative_path(model_path)
     if not path.exists():
         raise FileNotFoundError(f'Model not found: {path}')
-    return joblib.load(path)
+    return _cached_joblib_load(str(path))
 
 
 def load_preprocessor(preprocessor_path: str | Path = PREPROCESSOR_PATH) -> Any:
@@ -118,7 +141,7 @@ def load_preprocessor(preprocessor_path: str | Path = PREPROCESSOR_PATH) -> Any:
             f'Canonical preprocessor not found: {path}. '
             'Run src/cleaning.py once to generate it.'
         )
-    return joblib.load(path)
+    return _cached_joblib_load(str(path))
 
 
 def prepare_patient_canonical(
@@ -792,8 +815,8 @@ def generate_k_counterfactuals(
     target_label: int,
     target_index: int,
     k: int = 3,
-    max_iter: int = 300,
-    target_prob: float = 0.90,
+    max_iter: int = 500,
+    target_prob: float = 0.70,
     weights: LossWeights | None = None,
     seed: int = 42,
     proximity_mode: str = 'zscore',
@@ -801,7 +824,7 @@ def generate_k_counterfactuals(
     selection: str = 'pareto',
     pool_size: int | None = None,
     max_attempts: int | None = None,
-    n_neighbors: int = 40,
+    n_neighbors: int = 50,
     feature_order: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Generate counterfactuals and return Pareto-optimal subset by default.

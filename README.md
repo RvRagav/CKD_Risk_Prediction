@@ -82,6 +82,18 @@ If you don't see that kernel option, recreate it:
 - src/
   - Python modules used by notebooks/scripts (cleaning, training, synthesis, evaluation, visualization).
 
+## Clinical Dashboard (Streamlit)
+
+Run the doctor-facing dashboard locally:
+
+1. Install dependencies:
+  - `pip install -r requirements.txt`
+
+2. Start the app from the repo root:
+  - `streamlit run streamlit_app.py`
+
+The dashboard calls `src.counterfactual.generate_counterfactual(patient_input)` and presents CKD risk probability, counterfactual recommendations, clinical interpretation, metrics, feature-change visualization, SHAP top feature importance (when available), and multiple counterfactual options.
+
 ## Notes
 
 - Recommended order for a fresh run: CKD_Risk_Prediction.ipynb → CKD_Training.ipynb → CKD_Comparative_Analysis.ipynb.
