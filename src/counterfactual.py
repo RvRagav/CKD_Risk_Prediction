@@ -995,21 +995,67 @@ def explain_original_vs_counterfactual(
         out['note'] = f'Could not compute TreeExplainer SHAP: {e}'
         return out
 
-    # Normalize to (n_samples, n_features) for the selected class
-    def _select_class(shap_values: Any) -> np.ndarray:
-        if isinstance(shap_values, list):
-            # Binary classification often returns [class0, class1]
-            idx = int(target_index) if len(shap_values) > int(target_index) else -1
-            arr = np.asarray(shap_values[idx])
-        else:
-            arr = np.asarray(shap_values)
+    # Normalize to (n_samples, n_features) for the selected class.
+    # SHAP output formats vary across versions:
+    # - list of arrays [class0, class1] with shape (n_samples, n_features)
+    # - ndarray with shape (n_classes, n_samples, n_features)
+    # - ndarray with shape (n_samples, n_features, n_classes)  (common in SHAP>=0.48)
+    def _select_class(shap_values: Any, X: pd.DataFrame) -> np.ndarray:
+        cls_idx = int(target_index)
+
+        # SHAP may return list/tuple of class-specific arrays, or an Explanation-like
+        # container. Convert common wrappers into raw ndarrays.
+        if hasattr(shap_values, 'values') and not isinstance(shap_values, (np.ndarray, pd.DataFrame)):
+            shap_values = getattr(shap_values, 'values')
+
+        if isinstance(shap_values, (list, tuple)):
+            # Some SHAP versions return a single element for binary problems; others
+            # return per-class elements. Prefer the requested index when present.
+            if len(shap_values) == 0:
+                raise ValueError('Empty SHAP values container.')
+            if len(shap_values) == 1:
+                picked = shap_values[0]
+            else:
+                picked_idx = cls_idx if cls_idx < len(shap_values) else -1
+                picked = shap_values[picked_idx]
+            return _select_class(picked, X)
+
+        arr = np.asarray(shap_values, dtype=float)
+
+        # Common binary/single-output case for one sample: (n_features,)
+        if arr.ndim == 1:
+            n_features = int(X.shape[1])
+            if arr.shape[0] == n_features:
+                return arr.reshape(1, -1)
+            return arr.reshape(1, -1)
+
+        if arr.ndim == 2:
+            return arr
+
         if arr.ndim == 3:
-            # (n_classes, n_samples, n_features)
-            arr = arr[int(target_index)]
+            n_samples = int(X.shape[0])
+            n_features = int(X.shape[1])
+
+            # Case A: (n_samples, n_features, n_classes)
+            if arr.shape[0] == n_samples and arr.shape[1] == n_features:
+                idx = cls_idx if arr.shape[2] > cls_idx else -1
+                return arr[:, :, idx]
+
+            # Case A2: (n_samples, n_classes, n_features)
+            if arr.shape[0] == n_samples and arr.shape[2] == n_features:
+                idx = cls_idx if arr.shape[1] > cls_idx else -1
+                return arr[:, idx, :]
+
+            # Case B: (n_classes, n_samples, n_features)
+            if arr.shape[1] == n_samples and arr.shape[2] == n_features:
+                idx = cls_idx if arr.shape[0] > cls_idx else -1
+                return arr[idx, :, :]
+
+        # Fallback: try to coerce to 2D (may raise)
         return np.asarray(arr, dtype=float)
 
-    s0 = _select_class(shap_orig)[0]
-    s1 = _select_class(shap_cf)[0]
+    s0 = _select_class(shap_orig, x_original)[0]
+    s1 = _select_class(shap_cf, x_cf_best)[0]
     delta = s1 - s0
 
     # Simple explanation consistency: overlap of top-|SHAP| features.
@@ -1055,7 +1101,7 @@ def explain_original_vs_counterfactual(
                     x_noisy = apply_constraints(x0 + noise, x0, feature_order=feats)
                     df = pd.DataFrame([x_noisy], columns=feats)
                     sv = explainer.shap_values(df)
-                    runs.append(_select_class(sv)[0])
+                    runs.append(_select_class(sv, df)[0])
                 return np.stack(runs, axis=0).reshape(int(stability_runs), 1, len(feats))
 
             runs_orig = _stack_runs(x_original)
