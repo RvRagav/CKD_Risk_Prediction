@@ -86,11 +86,16 @@ If you don't see that kernel option, recreate it:
 
 Run the doctor-facing dashboard locally:
 
-1. Install dependencies:
+1. Use the recommended environment (Python 3.11):
+  - `conda activate ckd-shap50`
+
+2. Install dependencies:
   - `pip install -r requirements.txt`
 
-2. Start the app from the repo root:
+3. Start the app from the repo root:
   - `streamlit run streamlit_app.py`
+
+If you see errors mentioning a module "compiled with NumPy 1.x" while using NumPy 2.x, you are likely running Streamlit in the wrong Python environment. Activate `ckd-shap50` and re-run.
 
 The dashboard calls `src.counterfactual.generate_counterfactual(patient_input)` and presents CKD risk probability, counterfactual recommendations, clinical interpretation, metrics, feature-change visualization, SHAP top feature importance (when available), and multiple counterfactual options.
 

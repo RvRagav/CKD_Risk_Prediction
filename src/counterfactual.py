@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
+from collections.abc import Callable
  
 import joblib
 import numpy as np
@@ -474,25 +475,36 @@ def robustness_score(
     feats = feature_order or CANONICAL_FEATURES
     rng = rng or np.random.default_rng(0)
 
+    n_noise_i = int(n_noise)
+    if n_noise_i <= 0:
+        return 0.0
+
     base_df = pd.DataFrame([x_cf], columns=feats)
     assert_canonical_schema(base_df)
     base_pred = predict_proba_cf(model, base_df)[0]
 
     ranges = _feature_ranges(feats)
-    sims: list[float] = []
-    for _ in range(int(n_noise)):
-        noise = rng.normal(loc=0.0, scale=ranges * float(noise_frac), size=len(feats))
 
-        # Do not add Gaussian noise to binary/immutable features.
-        for i, f in enumerate(feats):
-            if f in BINARY_FEATURES or f in IMMUTABLE_FEATURES:
-                noise[i] = 0.0
+    # Generate all noise in one go (deterministic given rng), then batch predict.
+    noise = rng.normal(
+        loc=0.0,
+        scale=ranges * float(noise_frac),
+        size=(n_noise_i, len(feats)),
+    )
 
-        x_noisy = apply_constraints(x_cf + noise, x_cf, feature_order=feats)
-        noisy_df = pd.DataFrame([x_noisy], columns=feats)
-        pred = predict_proba_cf(model, noisy_df)[0]
-        sims.append(dice_similarity_continuous(base_pred, pred))
+    # Do not add Gaussian noise to binary/immutable features.
+    for i, f in enumerate(feats):
+        if f in BINARY_FEATURES or f in IMMUTABLE_FEATURES:
+            noise[:, i] = 0.0
 
+    noisy_rows: list[np.ndarray] = []
+    for r in range(n_noise_i):
+        x_noisy = apply_constraints(x_cf + noise[r], x_cf, feature_order=feats)
+        noisy_rows.append(x_noisy)
+
+    noisy_df = pd.DataFrame(noisy_rows, columns=feats)
+    preds = predict_proba_cf(model, noisy_df)
+    sims = [dice_similarity_continuous(base_pred, p) for p in preds]
     return float(np.mean(sims)) if sims else 0.0
 
 
@@ -624,6 +636,8 @@ def hill_climb_counterfactual(
     proximity_mode: str = 'zscore',
     feature_scales: np.ndarray | None = None,
     feature_order: list[str] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+    progress_every: int = 10,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Zero-order hill-climbing search for one counterfactual."""
 
@@ -652,11 +666,32 @@ def hill_climb_counterfactual(
         feature_order=feats,
     )
 
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                "Hill-climb start: "
+                f"p_target={best_parts.get('p_target', 0.0):.3f}, "
+                f"L_total={best_parts.get('L_total', best_L):.3f}"
+            )
+        except Exception:
+            pass
+
     stall = 0
-    for _ in range(int(max_iter)):
+    for it in range(int(max_iter)):
         # Early stop if we already achieved the target confidently
         if best_parts['p_target'] >= float(target_prob):
             break
+
+        if progress_callback is not None and int(progress_every) > 0:
+            if it % int(progress_every) == 0:
+                try:
+                    progress_callback(
+                        f"Hill-climb iter {it+1}/{int(max_iter)}: "
+                        f"p_target={best_parts.get('p_target', 0.0):.3f}, "
+                        f"L_total={best_parts.get('L_total', best_L):.3f}"
+                    )
+                except Exception:
+                    pass
 
         neighbors = _neighbor_candidates(
             x_best,
@@ -725,6 +760,11 @@ def hill_climb_counterfactual(
             # Simple restart if stuck for too long
             if stall >= 25:
                 stall = 0
+                if progress_callback is not None:
+                    try:
+                        progress_callback("Hill-climb restart (stalled)")
+                    except Exception:
+                        pass
                 noise = rng.normal(loc=0.0, scale=ranges * 0.05, size=len(feats))
                 for i, f in enumerate(feats):
                     if f in BINARY_FEATURES or f in IMMUTABLE_FEATURES:
@@ -826,6 +866,7 @@ def generate_k_counterfactuals(
     max_attempts: int | None = None,
     n_neighbors: int = 50,
     feature_order: list[str] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Generate counterfactuals and return Pareto-optimal subset by default.
 
@@ -851,8 +892,25 @@ def generate_k_counterfactuals(
     desired_pool = int(pool_size) if pool_size is not None else max(int(k) * 4, int(k))
     max_attempts_eff = int(max_attempts) if max_attempts is not None else max(desired_pool * 3, int(k) * 6)
 
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                "Counterfactual search: "
+                f"target_label={int(target_label)}, k={int(k)}, "
+                f"max_iter={int(max_iter)}, n_neighbors={int(n_neighbors)}, "
+                f"pool_size={int(desired_pool)}, max_attempts={int(max_attempts_eff)}"
+            )
+        except Exception:
+            pass
+
     for attempt in range(int(max_attempts_eff)):
         local_rng = np.random.default_rng(int(seed) * 10_000 + int(attempt))
+
+        if progress_callback is not None:
+            try:
+                progress_callback(f"Attempt {attempt+1}/{int(max_attempts_eff)}")
+            except Exception:
+                pass
 
         x_cf, parts = hill_climb_counterfactual(
             model=model,
@@ -867,6 +925,7 @@ def generate_k_counterfactuals(
             proximity_mode=proximity_mode,
             feature_scales=feature_scales,
             feature_order=feats,
+            progress_callback=progress_callback,
         )
 
         # Keep only if it truly achieves the target class (label match)
@@ -880,6 +939,14 @@ def generate_k_counterfactuals(
             else:
                 pred_label = int(np.argmax(proba))
         valid = int(pred_label) == int(target_label)
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    f"Attempt {attempt+1}: best p_target={float(proba[int(target_index)]):.3f}, "
+                    f"pred_label={int(pred_label)}, valid={bool(valid)}"
+                )
+            except Exception:
+                pass
         if not valid:
             continue
 
@@ -901,6 +968,12 @@ def generate_k_counterfactuals(
                 'robustness': float(parts.get('robustness', 0.0)),
             }
         )
+
+        if progress_callback is not None:
+            try:
+                progress_callback(f"Accepted {len(accepted)}/{int(desired_pool)} valid candidates")
+            except Exception:
+                pass
 
         if len(accepted) >= int(desired_pool):
             break
@@ -1194,6 +1267,7 @@ def generate_counterfactual(
     pool_size: int | None = None,
     max_attempts: int | None = None,
     n_neighbors: int = 40,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], pd.DataFrame]:
     """Main entrypoint.
 
@@ -1211,6 +1285,12 @@ def generate_counterfactual(
 
     model = load_model(model_path)
     preproc = load_preprocessor(preprocessor_path)
+
+    if progress_callback is not None:
+        try:
+            progress_callback('Loaded model + preprocessor')
+        except Exception:
+            pass
 
     patient_canon = prepare_patient_canonical(
         patient_input,
@@ -1246,6 +1326,7 @@ def generate_counterfactual(
         pool_size=pool_size,
         max_attempts=max_attempts,
         n_neighbors=int(n_neighbors),
+        progress_callback=progress_callback,
     )
 
     # Choose the best CF (highest p_target, then lowest proximity)

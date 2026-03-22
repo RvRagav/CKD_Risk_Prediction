@@ -999,6 +999,19 @@ def main() -> None:
     )
 
     if run_cf:
+        # Live debug log (helps when CF search takes long or returns empty)
+        debug_lines: list[str] = []
+        with st.expander("Show counterfactual debug log", expanded=True):
+            log_placeholder = st.empty()
+
+        def _cf_log(msg: str) -> None:
+            debug_lines.append(str(msg))
+            # Keep memory bounded
+            if len(debug_lines) > 250:
+                del debug_lines[:-250]
+            # Show tail only to keep UI responsive
+            log_placeholder.text("\n".join(debug_lines[-40:]))
+
         with st.spinner("⏳ Searching for counterfactuals… (this may take 15–30 seconds)"):
             try:
                 cf_df, metrics_df, explanation, comparison_df = generate_counterfactual(
@@ -1018,6 +1031,7 @@ def main() -> None:
                     explanation_stability_runs=0,
                     seed=42,
                     weights=_DEFAULT_CF_WEIGHTS,
+                    progress_callback=_cf_log,
                 )
             except Exception as e:
                 st.error("**Counterfactual error:** the search raised an exception.")
@@ -1029,6 +1043,7 @@ def main() -> None:
             metrics_df=metrics_df,
             explanation=explanation,
             comparison_df=comparison_df,
+            debug_log=debug_lines,
         )
         st.rerun()
 
@@ -1042,6 +1057,11 @@ def main() -> None:
     metrics_df   = cf_res["metrics_df"].copy()
     explanation  = dict(cf_res["explanation"])
     comparison_df = cf_res["comparison_df"].copy()
+
+    debug_log = cf_res.get("debug_log")
+    if isinstance(debug_log, list) and debug_log:
+        with st.expander("Counterfactual debug log"):
+            st.code("\n".join([str(x) for x in debug_log][-250:]), language="text")
 
     has_cf   = not metrics_df.empty and not cf_df.empty
     has_best = has_cf and (comparison_df["row"] == "best_counterfactual").any()
